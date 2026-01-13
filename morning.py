@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import random
+import time
 from datetime import date, datetime
 from typing import Any, Dict, List
+
+import requests
 
 from config import STATIONS
 from sources_registry import load_fetchers_safe
 from db import upsert_forecast, upsert_source, upsert_station, init_db
+
+
+MAX_ATTEMPTS = 3
+BASE_SLEEP_SECONDS = 1.0  # backoff base
 
 
 def _coerce_float(x: Any) -> float:
@@ -47,6 +55,55 @@ def _normalize_rows(rows: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _is_retryable_error(e: Exception) -> bool:
+    # Network-y stuff
+    if isinstance(e, (requests.Timeout, requests.ConnectionError)):
+        return True
+
+    # requests wraps HTTP status failures as HTTPError with response attached
+    if isinstance(e, requests.HTTPError):
+        resp = getattr(e, "response", None)
+        code = getattr(resp, "status_code", None)
+        if code is None:
+            return True
+        # retry 429 + 5xx
+        return code == 429 or code >= 500
+
+    # Tomorrow/other libs sometimes throw generic RuntimeError for 5xx;
+    # we conservatively retry a couple times for common transient words.
+    msg = str(e).lower()
+    transient_hints = [
+        "timed out",
+        "timeout",
+        "temporarily",
+        "try again",
+        "connection reset",
+        "connection aborted",
+        "service unavailable",
+        "internal server error",
+        "bad gateway",
+        "gateway timeout",
+        "too many requests",
+        "rate limit",
+    ]
+    return any(h in msg for h in transient_hints)
+
+
+def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return fetcher(station)
+        except Exception as e:
+            last_exc = e
+            if attempt >= MAX_ATTEMPTS or not _is_retryable_error(e):
+                raise
+            sleep_s = (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5
+            print(f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS} after error: {e}")
+            time.sleep(sleep_s)
+    raise last_exc  # unreachable
+
+
 def main() -> None:
     init_db()
 
@@ -70,11 +127,10 @@ def main() -> None:
         station_id = st["station_id"]
 
         for source_id, fetcher in fetchers.items():
-            # Set fetched_at per source call (more accurate than one timestamp for everything)
             fetched_at = datetime.now().isoformat(timespec="seconds")
 
             try:
-                raw_rows = fetcher(st)
+                raw_rows = _call_fetcher_with_retry(fetcher, st, source_id)
                 rows = _normalize_rows(raw_rows)
 
                 if not rows:
@@ -94,7 +150,6 @@ def main() -> None:
 
                 print(f"[morning] OK {station_id} {source_id}: saved {len(rows)} row(s)")
             except Exception as e:
-                # Never break the whole run for a single source
                 print(f"[morning] FAIL {station_id} {source_id}: {e}")
 
 
