@@ -40,26 +40,24 @@ def _is_postgres() -> bool:
 
 
 def _pg_connect():
-    """
-    Connect to Postgres using psycopg (v3) if available, else psycopg2.
-    """
     url = _db_url()
     if not url:
         raise RuntimeError("Postgres selected but WEATHER_DB_URL/DATABASE_URL not set")
 
     try:
         import psycopg  # type: ignore
-        # autocommit=False (default) so we can mimic sqlite commit behavior
-        return psycopg.connect(url)
-    except Exception:
+    except ImportError:
         try:
             import psycopg2  # type: ignore
             return psycopg2.connect(url)
         except Exception as e:
             raise RuntimeError(
                 "Postgres URL set, but neither psycopg nor psycopg2 is installed. "
-                "Install one: pip install psycopg[binary]  (recommended)  OR  pip install psycopg2-binary"
+                "Install one: pip install psycopg[binary] OR pip install psycopg2-binary"
             ) from e
+
+    # psycopg is installed; if connect fails, raise the real error
+    return psycopg.connect(url)
 
 
 def get_conn() -> Any:
@@ -382,3 +380,4 @@ def upsert_score(
         """, (station_id, source_id, forecast_date, target_date, high_error, low_error))
     conn.commit()
     conn.close()
+
