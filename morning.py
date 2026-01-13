@@ -12,8 +12,8 @@ from sources_registry import load_fetchers_safe
 from db import upsert_forecast, upsert_source, upsert_station, init_db
 
 
-MAX_ATTEMPTS = 3
-BASE_SLEEP_SECONDS = 1.0  # backoff base
+MAX_ATTEMPTS = 4
+BASE_SLEEP_SECONDS = 2.0  # backoff base
 
 
 def _coerce_float(x: Any) -> float:
@@ -151,7 +151,11 @@ def main() -> None:
                 print(f"[morning] OK {station_id} {source_id}: saved {len(rows)} row(s)")
             except Exception as e:
                 print(f"[morning] FAIL {station_id} {source_id}: {e}")
+            if source_id.startswith("OME_"):
+                time.sleep(0.4 + random.random() * 0.6)
+
 
 
 if __name__ == "__main__":
     main()
+
