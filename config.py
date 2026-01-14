@@ -11,12 +11,28 @@ STATIONS = [
         "name": "NYC Central Park",
         "lat": 40.78,
         "lon": -73.97,
+        "timezone": "EST",
     },
     {
         "station_id": "KMIA",
         "name": "Miami International Airport",
         "lat": 25.79,
         "lon": -80.32,
+        "timezone": "EST",
+    },
+    {
+        "station_id": "KNEW",
+        "name": "New Orleans Lakefront Airport",
+        "lat": 30.05,
+        "lon": -90.03,
+        "timezone": "CST",
+    },
+    {
+        "station_id": "KPHL",
+        "name": "Philadelphia International Airport",
+        "lat": 39.87,
+        "lon": -75.23,
+        "timezone": "EST",
     },
     # add more...
 ]
@@ -86,4 +102,5 @@ SOURCES = {
             "units": "imperial",
         },
     },
+
 }
