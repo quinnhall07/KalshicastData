@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 from etl_utils import utc_now_z
 
@@ -97,26 +97,52 @@ def upsert_observation(
     conn.commit()
     conn.close()
 
+def bulk_upsert_forecast_values(conn, rows: list[dict[str, Any]]) -> int:
+    """
+    rows: [{run_id, station_id, target_date, kind, value_f, lead_hours, extras_json}]
+    """
+    if not rows:
+        return 0
 
-def get_or_create_forecast_run(source: str, issued_at: str, meta: Optional[Dict[str, Any]] = None) -> str:
-    meta = meta or {}
-    conn = get_conn()
-    cur = conn.cursor()
+    sql = """
+    insert into public.forecasts
+      (run_id, station_id, target_date, kind, value_f, lead_hours, extras)
+    values
+      (%(run_id)s, %(station_id)s, %(target_date)s, %(kind)s, %(value_f)s, %(lead_hours)s, %(extras_json)s::jsonb)
+    on conflict (run_id, station_id, target_date, kind)
+    do update set
+      value_f = excluded.value_f,
+      lead_hours = excluded.lead_hours,
+      extras = excluded.extras
+    ;
+    """
 
-    cur.execute(
-        """
-        insert into public.forecast_runs (source, issued_at, meta)
-        values (%s, %s::timestamptz, %s::jsonb)
-        on conflict (source, issued_at) do update set fetched_at=now()
-        returning run_id
-        """,
-        (source, issued_at, json.dumps(meta)),
-    )
-    run_id = str(cur.fetchone()[0])
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
 
-    conn.commit()
-    conn.close()
-    return run_id
+    return len(rows)
+
+def get_or_create_forecast_run(source: str, issued_at: str, conn=None) -> int:
+    owns = False
+    if conn is None:
+        conn = get_conn()
+        owns = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                insert into public.forecast_runs (source, issued_at)
+                values (%s, %s)
+                on conflict (source, issued_at) do update set source = excluded.source
+                returning id;
+            """, (source, issued_at))
+            run_id = cur.fetchone()[0]
+        if owns:
+            conn.commit()
+        return run_id
+    finally:
+        if owns:
+            conn.close()
+
 
 
 def upsert_forecast_value(
@@ -409,4 +435,5 @@ def update_error_stats(*, window_days: int, station_id: Optional[str] = None) ->
 
     conn.commit()
     conn.close()
+
 
