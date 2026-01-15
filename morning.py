@@ -57,16 +57,7 @@ def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             print(f"[morning] fetch start {station['station_id']} {source_id} attempt={attempt}", flush=True)
-            fut = _executor.submit(fetcher, station)
-            return fut.result(timeout=FETCH_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError as e:
-            last_exc = e
-            msg = f"fetch timeout after {FETCH_TIMEOUT_SECONDS}s"
-            if attempt >= MAX_ATTEMPTS:
-                raise RuntimeError(msg) from e
-            sleep_s = min(5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5)
-            print(f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {msg}", flush=True)
-            time.sleep(sleep_s)
+            return fetcher(station)  # direct call (runs in worker thread)
         except Exception as e:
             last_exc = e
             if attempt >= MAX_ATTEMPTS or not _is_retryable_error(e):
@@ -74,7 +65,17 @@ def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
             sleep_s = min(5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5)
             print(f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}", flush=True)
             time.sleep(sleep_s)
-    raise last_exc  # unreachable
+    raise last_exc
+
+
+def _fetch_one(st: dict, source_id: str, fetcher):
+    station_id = st["station_id"]
+    try:
+        raw = _call_fetcher_with_retry(fetcher, st, source_id)
+        issued_at, rows = _normalize_payload(raw)
+        return (station_id, st, source_id, issued_at, rows, None)
+    except Exception as e:
+        return (station_id, st, source_id, None, [], e)
     
 
 def _normalize_payload(raw: Any) -> Tuple[str, List[Dict[str, Any]]]:
@@ -132,17 +133,23 @@ def main() -> None:
         print("[morning] ERROR: no enabled sources loaded (check config.SOURCES).")
         return
 
-    for st in STATIONS:
-        station_id = st["station_id"]
+    tasks = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        for st in STATIONS:
+            for source_id, fetcher in fetchers.items():
+                tasks.append(ex.submit(_fetch_one, st, source_id, fetcher))
 
-        for source_id, fetcher in fetchers.items():
-            try:
-                raw = _call_fetcher_with_retry(fetcher, st, source_id)
-                issued_at, rows = _normalize_payload(raw)
+        # Process results as they finish
+        for fut in concurrent.futures.as_completed(tasks):
+            station_id, st, source_id, issued_at, rows, err = fut.result()
 
-                if not rows:
-                    print(f"[morning] WARN {station_id} {source_id}: no rows")
-                    continue
+            if err is not None:
+                print(f"[morning] FAIL {station_id} {source_id}: {err}", flush=True)
+                continue
+
+            if not rows:
+                print(f"[morning] WARN {station_id} {source_id}: no rows", flush=True)
+                continue
                 
                 run_id = get_or_create_forecast_run(source=source_id, issued_at=issued_at)
                 
@@ -199,6 +206,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
