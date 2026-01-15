@@ -97,30 +97,38 @@ def upsert_observation(
     conn.commit()
     conn.close()
 
-def bulk_upsert_forecast_values(conn, rows: list[dict[str, Any]]) -> int:
-    """
-    rows: [{run_id, station_id, target_date, kind, value_f, lead_hours, extras_json}]
-    """
+def bulk_upsert_forecast_values(conn, rows: list[dict]) -> int:
     if not rows:
         return 0
 
     sql = """
-    insert into public.forecasts
-      (run_id, station_id, target_date, kind, value_f, lead_hours, extras)
-    values
-      (%(run_id)s, %(station_id)s, %(target_date)s, %(kind)s, %(value_f)s, %(lead_hours)s, %(extras_json)s::jsonb)
+    insert into public.forecasts (
+        run_id, station_id, target_date, kind, value_f, lead_hours,
+        dewpoint_f, humidity_pct, wind_speed_mph, wind_dir_deg,
+        cloud_cover_pct, precip_prob_pct, extras
+    ) values (
+        %(run_id)s, %(station_id)s, %(target_date)s, %(kind)s, %(value_f)s, %(lead_hours)s,
+        %(dewpoint_f)s, %(humidity_pct)s, %(wind_speed_mph)s, %(wind_dir_deg)s,
+        %(cloud_cover_pct)s, %(precip_prob_pct)s, %(extras)s::jsonb
+    )
     on conflict (run_id, station_id, target_date, kind)
     do update set
-      value_f = excluded.value_f,
-      lead_hours = excluded.lead_hours,
-      extras = excluded.extras
-    ;
+        value_f = excluded.value_f,
+        lead_hours = excluded.lead_hours,
+        dewpoint_f = excluded.dewpoint_f,
+        humidity_pct = excluded.humidity_pct,
+        wind_speed_mph = excluded.wind_speed_mph,
+        wind_dir_deg = excluded.wind_dir_deg,
+        cloud_cover_pct = excluded.cloud_cover_pct,
+        precip_prob_pct = excluded.precip_prob_pct,
+        extras = excluded.extras;
     """
 
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
 
     return len(rows)
+
 
 def get_or_create_forecast_run(source: str, issued_at: str, conn=None) -> int:
     owns = False
@@ -435,6 +443,7 @@ def update_error_stats(*, window_days: int, station_id: Optional[str] = None) ->
 
     conn.commit()
     conn.close()
+
 
 
 
