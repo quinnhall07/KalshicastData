@@ -2,17 +2,13 @@
 from __future__ import annotations
 
 import requests
-from datetime import date
-from typing import Dict, List, Optional, Tuple
+from datetime import date, datetime, timezone
+from typing import Dict, List, Tuple
 
 from config import HEADERS
 
 
 def _station_latlon(station_id: str) -> Tuple[float, float]:
-    """
-    Get (lat, lon) from api.weather.gov station metadata.
-    Works with station ids like KNYC (if recognized by NWS Stations API).
-    """
     url = f"https://api.weather.gov/stations/{station_id}"
     headers = dict(HEADERS)
     headers["Accept"] = "application/geo+json"
@@ -21,7 +17,6 @@ def _station_latlon(station_id: str) -> Tuple[float, float]:
     r.raise_for_status()
     data = r.json()
 
-    # geojson: geometry.coordinates = [lon, lat]
     coords = data.get("geometry", {}).get("coordinates")
     if not coords or len(coords) != 2:
         raise RuntimeError(f"NWS station {station_id} missing geometry coordinates")
@@ -30,9 +25,6 @@ def _station_latlon(station_id: str) -> Tuple[float, float]:
 
 
 def _forecast_url_from_latlon(lat: float, lon: float) -> str:
-    """
-    Resolve a lat/lon to the forecast endpoint URL via /points.
-    """
     url = f"https://api.weather.gov/points/{lat},{lon}"
     headers = dict(HEADERS)
     headers["Accept"] = "application/geo+json"
@@ -47,18 +39,12 @@ def _forecast_url_from_latlon(lat: float, lon: float) -> str:
 
 
 def _summarize_high_low_by_date(periods: List[dict]) -> Dict[str, Tuple[float, float]]:
-    """
-    Build {YYYY-MM-DD: (high, low)} from NWS forecast periods.
-    We take max/min temperature observed in that calendar date across all periods.
-    """
     out: Dict[str, List[float]] = {}
     for p in periods:
         start = p.get("startTime")
         temp = p.get("temperature")
         if start is None or temp is None:
             continue
-
-        # startTime is ISO string; date is first 10 chars "YYYY-MM-DD"
         d = str(start)[:10]
         out.setdefault(d, []).append(float(temp))
 
@@ -68,16 +54,9 @@ def _summarize_high_low_by_date(periods: List[dict]) -> Dict[str, Tuple[float, f
     return summarized
 
 
-def fetch_nws_forecast(station: dict) -> List[dict]:
-    """
-    Standardized fetcher interface:
-    Input: station dict from config (expects station_id)
-    Output: list of dicts for today + tomorrow:
-      [{"target_date":"YYYY-MM-DD","high":..,"low":..}, ...]
-    """
+def fetch_nws_forecast(station: dict) -> Dict[str, Any]:
     station_id = station.get("station_id")
 
-    # Prefer config coordinates if provided
     lat = station.get("lat")
     lon = station.get("lon")
 
@@ -105,11 +84,11 @@ def fetch_nws_forecast(station: dict) -> List[dict]:
     tomorrow = date.fromordinal(today.toordinal() + 1)
     want = [today.isoformat(), tomorrow.isoformat()]
 
-    results: List[dict] = []
+    rows: List[dict] = []
     for d in want:
         if d in hl_map:
             high, low = hl_map[d]
-            results.append({"target_date": d, "high": float(high), "low": float(low)})
+            rows.append({"target_date": d, "high": float(high), "low": float(low)})
 
-    # If it can't produce both days, still return what it has — morning.py will store it.
-    return results
+    issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return {"issued_at": issued_at, "rows": rows}
