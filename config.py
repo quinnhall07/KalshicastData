@@ -5,6 +5,13 @@ HEADERS = {
     "User-Agent": "Kalshicast/1.0 (contact: quinn.hall.scho@gmail.com)"
 }
 
+# Forecast collection cadence (UTC hours)
+FORECAST_CYCLE_UTC_HOURS = [0, 6, 12, 18]  # start with [0, 12] if you want 2x/day
+
+# Lead-time anchor times (local station time)
+TARGET_LOCAL_HOUR_HIGH = 15  # ~3pm local
+TARGET_LOCAL_HOUR_LOW = 7    # ~7am local
+
 STATIONS = [
     {
         "station_id": "KNYC",
@@ -196,5 +203,6 @@ SOURCES = {
     },
 
 }
+
 
 
