@@ -6,7 +6,7 @@ import random
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
-
+import threading
 import requests
 
 from config import STATIONS
@@ -27,6 +27,14 @@ MAX_ATTEMPTS = 4
 BASE_SLEEP_SECONDS = 1.0
 FETCH_TIMEOUT_SECONDS = 30
 
+_PROVIDER_LIMITS = {
+    "TOM": threading.Semaphore(1),   # Tomorrow.io
+    "WAPI": threading.Semaphore(2),
+    "VCR": threading.Semaphore(2),
+    "NWS": threading.Semaphore(4),
+    "OME": threading.Semaphore(3),
+}
+
 def _coerce_float(x: Any) -> float:
     if isinstance(x, (int, float)):
         return float(x)
@@ -34,6 +42,18 @@ def _coerce_float(x: Any) -> float:
         return float(x.strip())
     raise ValueError(f"not a number: {x!r}")
 
+def _provider_key(source_id: str) -> str:
+    if source_id.startswith("TOM"):
+        return "TOM"
+    if source_id.startswith("WAPI"):
+        return "WAPI"
+    if source_id.startswith("VCR"):
+        return "VCR"
+    if source_id.startswith("NWS"):
+        return "NWS"
+    if source_id.startswith("OME_"):
+        return "OME"
+    return "OTHER"
 
 def _is_retryable_error(e: Exception) -> bool:
     if isinstance(e, (requests.Timeout, requests.ConnectionError)):
@@ -177,6 +197,8 @@ def main() -> None:
                         kind="low",
                     )
 
+                    extras = r.get("extras") or {}
+                    
                     batch.append({
                         "run_id": run_id,
                         "station_id": station_id,
@@ -184,8 +206,19 @@ def main() -> None:
                         "kind": "high",
                         "value_f": r["high"],
                         "lead_hours": lead_high,
-                        "extras_json": extras_json,
+                    
+                        # dedicated predictor columns
+                        "dewpoint_f": extras.get("dewpoint_f"),
+                        "humidity_pct": extras.get("humidity_pct"),
+                        "wind_speed_mph": extras.get("wind_speed_mph"),
+                        "wind_dir_deg": extras.get("wind_dir_deg"),
+                        "cloud_cover_pct": extras.get("cloud_cover_pct"),
+                        "precip_prob_pct": extras.get("precip_prob_pct"),
+                    
+                        # jsonb column
+                        "extras": json.dumps(extras),
                     })
+                    
                     batch.append({
                         "run_id": run_id,
                         "station_id": station_id,
@@ -193,9 +226,18 @@ def main() -> None:
                         "kind": "low",
                         "value_f": r["low"],
                         "lead_hours": lead_low,
-                        "extras_json": extras_json,
+                    
+                        "dewpoint_f": extras.get("dewpoint_f"),
+                        "humidity_pct": extras.get("humidity_pct"),
+                        "wind_speed_mph": extras.get("wind_speed_mph"),
+                        "wind_dir_deg": extras.get("wind_dir_deg"),
+                        "cloud_cover_pct": extras.get("cloud_cover_pct"),
+                        "precip_prob_pct": extras.get("precip_prob_pct"),
+                    
+                        "extras": json.dumps(extras),
                     })
-
+                
+                
                 # Batched write (single round trip)
                 wrote = bulk_upsert_forecast_values(conn, batch)
                 conn.commit()
@@ -218,6 +260,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
