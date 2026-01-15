@@ -138,25 +138,41 @@ def main() -> None:
                     td = r["target_date"]
                     extras = r.get("extras") or {}
 
+                    from etl_utils import compute_lead_hours
+                    
+                    lead_high = compute_lead_hours(
+                        station_tz=st["timezone"],
+                        issued_at=issued_at,
+                        target_date=td,
+                        kind="high",
+                    )
+                    
+                    lead_low = compute_lead_hours(
+                        station_tz=st["timezone"],
+                        issued_at=issued_at,
+                        target_date=td,
+                        kind="low",
+                    )
+                    
                     upsert_forecast_value(
                         run_id=run_id,
                         station_id=station_id,
                         target_date=td,
                         kind="high",
                         value_f=r["high"],
-                        lead_hours=None,
+                        lead_hours=lead_high,
                         extras=extras,
                     )
+                    
                     upsert_forecast_value(
                         run_id=run_id,
                         station_id=station_id,
                         target_date=td,
                         kind="low",
                         value_f=r["low"],
-                        lead_hours=None,
+                        lead_hours=lead_low,
                         extras=extras,
                     )
-
                 print(f"[morning] OK {station_id} {source_id}: saved {len(rows)} day(s) issued_at={issued_at}")
             except Exception as e:
                 print(f"[morning] FAIL {station_id} {source_id}: {e}")
@@ -167,3 +183,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
