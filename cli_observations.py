@@ -1,11 +1,13 @@
-#cli_observations.py
+# cli_observations.py
 from __future__ import annotations
 
 import math
 import time as time_mod
 import requests
-from datetime import datetime, date, time, timezone
+from datetime import datetime, date, time
 from typing import Optional, List
+
+from zoneinfo import ZoneInfo
 
 from config import STATIONS, HEADERS
 from db import upsert_observation, upsert_station
@@ -31,19 +33,27 @@ def _extract_temps_f(features: List[dict]) -> List[float]:
 
 
 def fetch_observations_for_station(station: dict, target_date: str) -> bool:
-    """
-    Fetch observations for a single station and calendar date (YYYY-MM-DD).
-    Computes observed high/low from all reported temps in that window and upserts into DB.
-    """
     station_id = station["station_id"]
-    upsert_station(station_id, station.get("name"), station.get("lat"), station.get("lon"))
+
+    upsert_station(
+        station_id=station_id,
+        name=station.get("name"),
+        lat=station.get("lat"),
+        lon=station.get("lon"),
+        timezone=station.get("timezone"),
+        state=station.get("state"),
+        elevation_ft=station.get("elevation_ft"),
+        is_active=station.get("is_active"),
+    )
 
     target = date.fromisoformat(target_date)
+    tz = ZoneInfo(station.get("timezone") or "UTC")
 
-    # This uses "target_date midnight -> 23:59" in *your local time converted to UTC*.
-    # That's acceptable for now; if you later want strict station-local time, we can adjust.
-    start_utc = datetime.combine(target, time(0, 0)).astimezone(timezone.utc).isoformat()
-    end_utc = datetime.combine(target, time(23, 59)).astimezone(timezone.utc).isoformat()
+    # Station-local day window -> UTC
+    start_local = datetime.combine(target, time(0, 0), tzinfo=tz)
+    end_local = datetime.combine(target, time(23, 59), tzinfo=tz)
+    start_utc = start_local.astimezone(ZoneInfo("UTC")).isoformat()
+    end_utc = end_local.astimezone(ZoneInfo("UTC")).isoformat()
 
     url = f"https://api.weather.gov/stations/{station_id}/observations"
     params = {"start": start_utc, "end": end_utc, "limit": 500}
@@ -51,14 +61,13 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
     headers = dict(HEADERS)
     headers["Accept"] = "application/geo+json"
 
-    # Light retry for transient DNS/timeouts
     last_err: Optional[Exception] = None
     for attempt in range(3):
         try:
             r = requests.get(url, headers=headers, params=params, timeout=25)
             r.raise_for_status()
-            data = r.json()
-            feats = data.get("features", [])
+            payload = r.json()
+            feats = payload.get("features", [])
             temps_f = _extract_temps_f(feats)
 
             if not temps_f:
@@ -74,7 +83,6 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
 
         except requests.RequestException as e:
             last_err = e
-            # brief backoff
             time_mod.sleep(1.5 * (attempt + 1))
 
     print(f"[obs] FAIL {station_id} {target_date}: {last_err}")
@@ -90,5 +98,3 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
-
-
