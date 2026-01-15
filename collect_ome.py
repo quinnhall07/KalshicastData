@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import requests
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List
 
 from config import HEADERS
@@ -10,15 +10,7 @@ from config import HEADERS
 OME_URL = "https://api.open-meteo.com/v1/forecast"
 
 
-def fetch_ome_forecast(station: dict, params: Dict[str, Any] | None = None) -> List[dict]:
-    """
-    Open-Meteo "forecast" endpoint (auto/blended models) -> standardized output.
-
-    Note:
-      - This endpoint is best treated as a single source (OME_BASE).
-      - Per-model runs (GFS/ECMWF/GEM/ICON) should use model-specific endpoints
-        via collect_omodel.py, not params on /v1/forecast.
-    """
+def fetch_ome_forecast(station: dict, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     lat = station.get("lat")
     lon = station.get("lon")
     if lat is None or lon is None:
@@ -49,23 +41,19 @@ def fetch_ome_forecast(station: dict, params: Dict[str, Any] | None = None) -> L
     dates = daily.get("time") or []
     tmax = daily.get("temperature_2m_max") or []
     tmin = daily.get("temperature_2m_min") or []
-
     if not dates:
-        return []
+        return {"issued_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"), "rows": []}
 
-    # Guard against weird partial payloads
     n = min(len(dates), len(tmax), len(tmin))
-    if n == 0:
-        return []
-
-    out: List[dict] = []
+    rows: List[dict] = []
     for i in range(n):
         d = str(dates[i])[:10]
         if d not in want:
             continue
         try:
-            out.append({"target_date": d, "high": float(tmax[i]), "low": float(tmin[i])})
+            rows.append({"target_date": d, "high": float(tmax[i]), "low": float(tmin[i])})
         except Exception:
             continue
 
-    return out
+    issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return {"issued_at": issued_at, "rows": rows}
