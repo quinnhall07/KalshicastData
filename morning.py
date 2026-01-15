@@ -76,18 +76,29 @@ _executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
     last_exc: Exception | None = None
+    sem = _PROVIDER_LIMITS.get(_provider_key(source_id))
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             print(f"[morning] fetch start {station['station_id']} {source_id} attempt={attempt}", flush=True)
-            return fetcher(station)  # direct call (runs in worker thread)
+            if sem:
+                with sem:
+                    return fetcher(station)
+            return fetcher(station)
         except Exception as e:
             last_exc = e
             if attempt >= MAX_ATTEMPTS or not _is_retryable_error(e):
                 raise
-            sleep_s = min(5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5)
+
+            msg = str(e).lower()
+            is_429 = "429" in msg or "too many requests" in msg or "rate limit" in msg
+            sleep_s = (10.0 + random.random() * 5.0) if is_429 else min(5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5)
+
             print(f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}", flush=True)
             time.sleep(sleep_s)
+
     raise last_exc
+
 
 
 def _fetch_one(st: dict, source_id: str, fetcher):
@@ -260,6 +271,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
