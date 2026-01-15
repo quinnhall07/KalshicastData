@@ -5,7 +5,7 @@ import os
 import time
 import random
 import requests
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List
 
 from config import HEADERS
@@ -32,34 +32,23 @@ def _post_with_retry(
     headers: dict,
     timeout: int = 20,
 ):
-    """
-    POST with one retry for 5xx or 429 responses.
-    """
     for attempt in (1, 2):
         r = requests.post(url, params=params, json=json, headers=headers, timeout=timeout)
-
-        # Success or non-retryable client error
         if r.status_code < 500 and r.status_code != 429:
             r.raise_for_status()
             return r
-
-        # Last attempt → raise
         if attempt == 2:
             r.raise_for_status()
-
-        # Small backoff with jitter
         sleep_s = (0.75 * attempt) + random.random() * 0.25
         time.sleep(sleep_s)
-
     raise RuntimeError("unreachable")
 
 
-def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> List[dict]:
+def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
     Tomorrow.io daily forecast -> standardized output
-
-    Output:
-      [{"target_date":"YYYY-MM-DD","high":float,"low":float}, ...]
+    Returns:
+      {"issued_at":"...Z","rows":[{"target_date":"YYYY-MM-DD","high":..,"low":.., extras...}, ...]}
     """
     lat = station.get("lat")
     lon = station.get("lon")
@@ -75,7 +64,16 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> L
 
     payload = {
         "location": f"{float(lat)},{float(lon)}",
-        "fields": ["temperatureMax", "temperatureMin"],
+        "fields": [
+            "temperatureMax",
+            "temperatureMin",
+            "dewPointAvg",
+            "humidityAvg",
+            "windSpeedAvg",
+            "windDirectionAvg",
+            "cloudCoverAvg",
+            "precipitationProbabilityAvg",
+        ],
         "timesteps": ["1d"],
         "units": units,
         "startTime": today.isoformat(),
@@ -91,6 +89,15 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> L
     )
     data = r.json()
 
+    issued_at = (
+        (data.get("data") or {}).get("time")
+        or (data.get("data") or {}).get("timestep")  # fallback (rare)
+    )
+    if isinstance(issued_at, str) and issued_at.endswith("Z"):
+        issued_at = issued_at
+    else:
+        issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
     timelines = (data.get("data") or {}).get("timelines") or []
     if not timelines:
         raise RuntimeError("Tomorrow.io returned no timelines")
@@ -104,11 +111,10 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> L
         date.fromordinal(today.toordinal() + 1).isoformat(),
     }
 
-    out: List[dict] = []
+    rows: List[dict] = []
     for iv in intervals:
         start = iv.get("startTime")
         values = iv.get("values") or {}
-
         if not start:
             continue
 
@@ -121,6 +127,21 @@ def fetch_tom_forecast(station: dict, params: Dict[str, Any] | None = None) -> L
         if hi is None or lo is None:
             continue
 
-        out.append({"target_date": d, "high": float(hi), "low": float(lo)})
+        row: Dict[str, Any] = {"target_date": d, "high": float(hi), "low": float(lo)}
 
-    return out
+        if values.get("dewPointAvg") is not None:
+            row["dewpoint_f"] = float(values["dewPointAvg"])
+        if values.get("humidityAvg") is not None:
+            row["humidity_pct"] = float(values["humidityAvg"])
+        if values.get("windSpeedAvg") is not None:
+            row["wind_speed_mph"] = float(values["windSpeedAvg"])
+        if values.get("windDirectionAvg") is not None:
+            row["wind_dir_deg"] = float(values["windDirectionAvg"])
+        if values.get("cloudCoverAvg") is not None:
+            row["cloud_cover_pct"] = float(values["cloudCoverAvg"])
+        if values.get("precipitationProbabilityAvg") is not None:
+            row["precip_prob_pct"] = float(values["precipitationProbabilityAvg"])
+
+        rows.append(row)
+
+    return {"issued_at": issued_at, "rows": rows}
