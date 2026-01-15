@@ -12,7 +12,7 @@ from sources_registry import load_fetchers_safe
 from db import upsert_forecast, upsert_source, upsert_station, init_db
 
 
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = 10
 BASE_SLEEP_SECONDS = 2.0  # backoff base
 
 
@@ -158,4 +158,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
