@@ -16,6 +16,7 @@ from db import (
     upsert_location,
     get_or_create_forecast_run,
     upsert_forecast_value,
+    compute_revisions_for_run
 )
 
 
@@ -174,6 +175,12 @@ def main() -> None:
                         extras=extras,
                     )
                 print(f"[morning] OK {station_id} {source_id}: saved {len(rows)} day(s) issued_at={issued_at}")
+                try:
+                    wrote_rev = compute_revisions_for_run(run_id)
+                    if wrote_rev:
+                        print(f"[morning] revisions {station_id} {source_id}: {wrote_rev}")
+                except Exception as e:
+                    print(f"[morning] revisions FAIL {station_id} {source_id}: {e}")
             except Exception as e:
                 print(f"[morning] FAIL {station_id} {source_id}: {e}")
 
@@ -183,4 +190,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
