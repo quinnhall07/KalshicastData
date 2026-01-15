@@ -11,6 +11,7 @@ import requests
 
 from config import STATIONS
 from sources_registry import load_fetchers_safe
+from etl_utils import compute_lead_hours
 from db import (
     init_db,
     upsert_location,
@@ -150,8 +151,6 @@ def main() -> None:
                 for r in rows:
                     td = r["target_date"]
                     extras = r.get("extras") or {}
-
-                    from etl_utils import compute_lead_hours
                     
                     lead_high = compute_lead_hours(
                         station_tz=st["timezone"],
@@ -202,6 +201,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
