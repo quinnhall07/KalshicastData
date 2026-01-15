@@ -1,10 +1,12 @@
+# .github/workflows/weather.yml
 name: Weather pipeline
 
 on:
   schedule:
-    # GitHub Actions cron is UTC. :contentReference[oaicite:4]{index=4}
-    - cron: "58 5 * * *"   # 1:00am America/New_York = 06:00 UTC (standard time)
-    - cron: "3 6 * * *"   # 1:03am America/New_York = 06:03 UTC
+    # Forecast ingest (UTC)
+    - cron: "0 0,6,12,18 * * *"
+    # Observations + scoring (UTC; late enough for NWS CLI to settle)
+    - cron: "30 12 * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -15,6 +17,7 @@ jobs:
       TOMORROW_API_KEY: ${{ secrets.TOMORROW_API_KEY }}
       WEATHERAPI_KEY: ${{ secrets.WEATHERAPI_KEY }}
       VISUALCROSSING_KEY: ${{ secrets.VISUALCROSSING_KEY }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -27,11 +30,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run morning
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '58 5 * * *'
-        run: python morning.py
+      - name: Forecast ingest (morning)
+        run: |
+          python morning.py
 
-      - name: Run night
-        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '3 6 * * *'
-        run: python night.py
-
+      - name: Observations + scoring (night)
+        run: |
+          python night.py
