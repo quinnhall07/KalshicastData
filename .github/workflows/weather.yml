@@ -8,7 +8,16 @@ on:
     - cron: "0 12 * * *"
     - cron: "0 18 * * *"
     - cron: "30 12 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which job to run"
+        required: true
+        default: "night"
+        type: choice
+        options:
+          - night
+          - morning
 
 jobs:
   run:
@@ -31,10 +40,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Forecast ingest (morning)
-        if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule != '30 12 * * *' }}
+      - name: Run morning
+        if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 6 * * *' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'morning') }}
         run: python morning.py
-
-      - name: Observations + scoring (night)
-        if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '30 12 * * *' }}
+      
+      - name: Run night
+        if: ${{ github.event_name == 'schedule' && github.event.schedule == '30 12 * * *' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'night') }}
         run: python night.py
+
