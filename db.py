@@ -8,6 +8,19 @@ from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 from etl_utils import utc_now_z
 
+# db.py additions
+from dataclasses import dataclass
+
+# Observation source priority (higher wins)
+_OBS_SOURCE_PRIORITY = {
+    "NWS_CLI": 100,
+    "nws_cli": 100,
+    "NWS_OBS_FALLBACK": 10,
+    "nws_station_obs": 10,
+}
+
+def _obs_priority(source: str) -> int:
+    return _OBS_SOURCE_PRIORITY.get(source, 0)
 
 def _db_url() -> str:
     url = os.getenv("WEATHER_DB_URL") or os.getenv("DATABASE_URL")
@@ -74,28 +87,137 @@ def upsert_observation(
     issued_at: Optional[str] = None,
     raw_text: Optional[str] = None,
     source: str = "nws_station_obs",
+    *,
+    run_issued_at: Optional[str] = None,
 ) -> None:
+    """
+    Writes an observation in a safe way.
+
+    Behavior:
+      - If new tables exist (observation_runs + observations_v2), store observations as multi-run snapshots.
+      - Otherwise, write to legacy public.observations keyed by (station_id, date),
+        but DO NOT allow a lower-authority source to overwrite a higher-authority one.
+
+    Inputs:
+      - issued_at: issuance time of the underlying product (CLI issuance time). Optional.
+      - run_issued_at: the "run snapshot time" (e.g., 02:00 UTC or 14:00 UTC). If omitted, uses now().
+    """
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        insert into public.observations
-          (station_id, date, observed_high, observed_low, issued_at, fetched_at, raw_text, source)
-        values (%s,%s::date,%s,%s,%s::timestamptz, now(), %s, %s)
-        on conflict (station_id, date) do update set
-          observed_high=excluded.observed_high,
-          observed_low=excluded.observed_low,
-          issued_at=coalesce(excluded.issued_at, public.observations.issued_at),
-          fetched_at=now(),
-          raw_text=coalesce(excluded.raw_text, public.observations.raw_text),
-          source=excluded.source
-        """,
-        (station_id, obs_date, observed_high, observed_low, issued_at, raw_text, source),
-    )
+    # decide run snapshot timestamp
+    if run_issued_at is None:
+        run_issued_at = utc_now_z()
 
-    conn.commit()
-    conn.close()
+    try:
+        # detect whether new schema exists
+        cur.execute("""
+            select to_regclass('public.observation_runs') is not null as has_runs,
+                   to_regclass('public.observations_v2') is not null as has_obs_v2
+        """)
+        has_runs, has_obs_v2 = cur.fetchone()
+        has_new = bool(has_runs) and bool(has_obs_v2)
+
+        if has_new:
+            run_id = get_or_create_observation_run(run_issued_at, conn=conn)
+
+            cur.execute(
+                """
+                insert into public.observations_v2
+                  (run_id, station_id, date, observed_high, observed_low, issued_at, fetched_at, raw_text, source)
+                values
+                  (%s, %s, %s::date, %s, %s, %s::timestamptz, now(), %s, %s)
+                on conflict (run_id, station_id, date) do update set
+                  observed_high = excluded.observed_high,
+                  observed_low  = excluded.observed_low,
+                  issued_at     = coalesce(excluded.issued_at, public.observations_v2.issued_at),
+                  fetched_at    = now(),
+                  raw_text      = coalesce(excluded.raw_text, public.observations_v2.raw_text),
+                  source        = excluded.source
+                """,
+                (run_id, station_id, obs_date, observed_high, observed_low, issued_at, raw_text, source),
+            )
+
+            conn.commit()
+            return
+
+        # --- legacy table path ---
+        # Fetch current row to enforce "no downgrade" (fallback cannot overwrite CLI)
+        cur.execute(
+            """
+            select source
+            from public.observations
+            where station_id=%s and date=%s::date
+            """,
+            (station_id, obs_date),
+        )
+        row = cur.fetchone()
+        existing_source = row[0] if row else None
+
+        if existing_source is not None:
+            if _obs_priority(source) < _obs_priority(str(existing_source)):
+                # Do not overwrite a better observation with a worse one
+                # Still update fetched_at so you can observe activity if desired.
+                cur.execute(
+                    """
+                    update public.observations
+                    set fetched_at = now()
+                    where station_id=%s and date=%s::date
+                    """,
+                    (station_id, obs_date),
+                )
+                conn.commit()
+                return
+
+        # Write/overwrite allowed (same or higher authority)
+        cur.execute(
+            """
+            insert into public.observations
+              (station_id, date, observed_high, observed_low, issued_at, fetched_at, raw_text, source)
+            values (%s, %s::date, %s, %s, %s::timestamptz, now(), %s, %s)
+            on conflict (station_id, date) do update set
+              observed_high = excluded.observed_high,
+              observed_low  = excluded.observed_low,
+              issued_at     = coalesce(excluded.issued_at, public.observations.issued_at),
+              fetched_at    = now(),
+              raw_text      = coalesce(excluded.raw_text, public.observations.raw_text),
+              source        = excluded.source
+            """,
+            (station_id, obs_date, observed_high, observed_low, issued_at, raw_text, source),
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+def get_or_create_observation_run(run_issued_at: str, conn=None) -> int:
+    """
+    Requires migration: public.observation_runs(run_id, run_issued_at unique).
+    """
+    owns = False
+    if conn is None:
+        conn = get_conn()
+        owns = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into public.observation_runs (run_issued_at)
+                values (%s::timestamptz)
+                on conflict (run_issued_at) do update set run_issued_at = excluded.run_issued_at
+                returning run_id
+                """,
+                (run_issued_at,),
+            )
+            run_id = cur.fetchone()[0]
+        if owns:
+            conn.commit()
+        return int(run_id)
+    finally:
+        if owns:
+            conn.close()
+
 
 def bulk_upsert_forecast_values(conn, rows: list[dict]) -> int:
     if not rows:
@@ -183,13 +305,13 @@ def upsert_forecast_value(
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute(
+        cur.execute(
         """
         insert into public.forecasts
           (run_id, station_id, target_date, kind, value_f, lead_hours,
            dewpoint_f, humidity_pct, wind_speed_mph, wind_dir_deg, cloud_cover_pct, precip_prob_pct)
         values
-          (%s::uuid,%s,%s::date,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+          (%s,%s,%s::date,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         on conflict (run_id, station_id, target_date, kind) do update set
           value_f=excluded.value_f,
           lead_hours=coalesce(excluded.lead_hours, public.forecasts.lead_hours),
@@ -211,14 +333,32 @@ def build_errors_for_date(target_date: str) -> int:
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute(
-        """
-        select station_id, observed_high, observed_low
-        from public.observations
-        where date=%s::date
-        """,
-        (target_date,),
-    )
+    # Prefer observations_latest if it exists; fallback to observations
+    cur.execute("""
+        select
+          to_regclass('public.observations_latest') is not null as has_latest
+    """)
+    has_latest = bool(cur.fetchone()[0])
+
+    if has_latest:
+        cur.execute(
+            """
+            select station_id, observed_high, observed_low
+            from public.observations_latest
+            where date=%s::date
+            """,
+            (target_date,),
+        )
+    else:
+        cur.execute(
+            """
+            select station_id, observed_high, observed_low
+            from public.observations
+            where date=%s::date
+            """,
+            (target_date,),
+        )
+        
     obs_rows = cur.fetchall()
     if not obs_rows:
         conn.close()
@@ -290,7 +430,7 @@ def _percentile(sorted_vals: List[float], p: float) -> float:
 # db.py (ADD these functions at end)
 from typing import Optional
 
-def compute_revisions_for_run(run_id: str) -> int:
+def compute_revisions_for_run(run_id) -> int:
     """
     For all forecast rows in a run, compute delta vs previous issued_at for the same
     (station_id, source, kind, target_date). Idempotent via PK.
@@ -303,7 +443,7 @@ def compute_revisions_for_run(run_id: str) -> int:
         select r.source, r.issued_at, f.station_id, f.target_date, f.kind, f.value_f
         from public.forecasts f
         join public.forecast_runs r on r.run_id = f.run_id
-        where f.run_id = %s::uuid
+        where f.run_id = %s
         """,
         (run_id,),
     )
@@ -451,6 +591,7 @@ def update_error_stats(*, window_days: int, station_id: Optional[str] = None) ->
 
     conn.commit()
     conn.close()
+
 
 
 
