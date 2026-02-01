@@ -85,16 +85,20 @@ def _fetch_product(product_id_or_url: str) -> Tuple[str, Optional[str]]:
 
 
 def _parse_cli_max_min(text: str) -> Optional[Tuple[float, float]]:
-    # Common CLI variants across offices
+    # 1) Try explicit "MAXIMUM: 27" style (some offices)
     max_patterns = [
         r"\bMAXIMUM(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
         r"\bMAX(?:IMUM)?\s+TEMP(?:ERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
         r"\bHIGH(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
+        # dot-leader variants: MAXIMUM .... 27
+        r"\bMAXIMUM(?:\s+TEMPERATURE)?(?:\s*\(.*?\))?\s*\.{2,}\s*([\-]?\d+(?:\.\d+)?)\b",
     ]
     min_patterns = [
         r"\bMINIMUM(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
         r"\bMIN(?:IMUM)?\s+TEMP(?:ERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
         r"\bLOW(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
+        # dot-leader variants: MINIMUM .... 12
+        r"\bMINIMUM(?:\s+TEMPERATURE)?(?:\s*\(.*?\))?\s*\.{2,}\s*([\-]?\d+(?:\.\d+)?)\b",
     ]
 
     hi: Optional[float] = None
@@ -118,19 +122,38 @@ def _parse_cli_max_min(text: str) -> Optional[Tuple[float, float]]:
             except ValueError:
                 pass
 
+    # 2) Table format (your MDW sample)
+    if hi is None:
+        m = re.search(r"^\s*MAXIMUM\s+([\-]?\d+(?:\.\d+)?)\b", text, flags=re.IGNORECASE | re.MULTILINE)
+        if m:
+            hi = float(m.group(1))
+
+    if lo is None:
+        m = re.search(r"^\s*MINIMUM\s+([\-]?\d+(?:\.\d+)?)\b", text, flags=re.IGNORECASE | re.MULTILINE)
+        if m:
+            lo = float(m.group(1))
+
     if hi is None or lo is None:
         return None
     return round(hi, 1), round(lo, 1)
 
+def _cli_matches_site(text: str, cli_site: str) -> bool:
+    t = text.upper()
+    s = cli_site.upper()
+    return (f"CLI{s}" in t) or (re.search(rf"\bCLI{s}\b", t) is not None) or (s in t)
 
 def _parse_cli_report_date(text: str) -> Optional[str]:
-    # Many CLI products include a header like "CLIMATE SUMMARY FOR ... <Month> <DD> <YYYY>"
-    # We use this as a weak validation so we don't ingest a report for the wrong day.
-    m = re.search(r"\bCLIMATE SUMMARY(?:.*?)\b(\w+\s+\d{1,2}\s+\d{4})\b", text, flags=re.IGNORECASE | re.DOTALL)
+    # Examples:
+    # "...THE CHICAGO-MIDWAY CLIMATE SUMMARY FOR JANUARY 31 2026..."
+    m = re.search(
+        r"\bCLIMATE\s+SUMMARY\s+FOR\s+([A-Z]+\s+\d{1,2}\s+\d{4})\b",
+        text.upper(),
+        flags=re.DOTALL,
+    )
     if not m:
         return None
     try:
-        dt = datetime.strptime(m.group(1), "%B %d %Y").date()
+        dt = datetime.strptime(m.group(1).title(), "%B %d %Y").date()
         return dt.isoformat()
     except Exception:
         return None
@@ -157,6 +180,43 @@ def _fallback_station_obs(station: dict, target_date: str) -> Optional[Tuple[flo
     if not temps_f:
         return None
     return round(max(temps_f), 1), round(min(temps_f), 1)
+
+def _list_cli_products(cwa: str) -> List[dict]:
+    url = f"https://api.weather.gov/products/types/CLI/locations/{cwa}"
+    headers = dict(HEADERS)
+    headers["Accept"] = "application/ld+json"
+    payload = _get_json(url, headers=headers, params=None, timeout=25, attempts=3)
+    items = payload.get("@graph")
+    return [x for x in items if isinstance(x, dict)] if isinstance(items, list) else []
+
+def _fetch_cli_text_with_fallback(cwa: str) -> tuple[str, Optional[str]]:
+    try:
+        return _fetch_latest_cli_text(cwa)
+    except Exception:
+        pass
+
+    items = _list_cli_products(cwa)
+    if not items:
+        raise ValueError(f"no CLI products for CWA={cwa}")
+
+    # sort newest-first if issuance timestamp exists
+    def _ts(it: dict) -> str:
+        return str(it.get("issuanceTime") or it.get("issueTime") or it.get("issuedAt") or "")
+
+    items_sorted = sorted(items, key=_ts, reverse=True)
+
+    last_err: Optional[Exception] = None
+    for it in items_sorted[:30]:
+        pid = it.get("id") or it.get("@id")
+        if not isinstance(pid, str) or not pid.strip():
+            continue
+        try:
+            return _fetch_product(pid.strip())
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise ValueError(f"failed to fetch any CLI product text; last_err={last_err}")
 
 def _fetch_latest_cli_text(cwa: str) -> tuple[str, Optional[str]]:
     url = f"https://api.weather.gov/products/types/CLI/locations/{cwa}/latest"
@@ -194,11 +254,12 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
             raise ValueError("missing lat/lon (required for CLI lookup)")
 
         cwa = _get_cwa(float(lat), float(lon))
-        text, issued_at = _fetch_latest_cli_text(cwa)
+        text, issued_at = _fetch_cli_text_with_fallback(cwa)
         
         # Filter to correct climate site (keeps you from ingesting the wrong city)
-        if cli_site not in text:
+        if not _cli_matches_site(text, cli_site):
             raise ValueError(f"latest CLI not for site={cli_site}")
+
         
         report_date = _parse_cli_report_date(text)
         if report_date and report_date != target_date:
@@ -251,4 +312,5 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
+
 
