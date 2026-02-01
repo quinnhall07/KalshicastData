@@ -14,10 +14,6 @@ from config import STATIONS, HEADERS
 from db import upsert_observation, upsert_location
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-
 def c_to_f(c: float) -> float:
     return (c * 9.0 / 5.0) + 32.0
 
@@ -47,7 +43,7 @@ def _is_retryable_http(e: Exception) -> bool:
     return False
 
 
-def _get_json_with_retry(url: str, *, headers: dict, params: Optional[dict] = None, timeout: int = 25, attempts: int = 3) -> dict:
+def _get_json(url: str, *, headers: dict, params: Optional[dict] = None, timeout: int = 25, attempts: int = 3) -> dict:
     last: Optional[Exception] = None
     for i in range(attempts):
         try:
@@ -62,41 +58,11 @@ def _get_json_with_retry(url: str, *, headers: dict, params: Optional[dict] = No
     raise last  # pragma: no cover
 
 
-def _get_text_with_retry(url: str, *, headers: dict, timeout: int = 25, attempts: int = 3) -> str:
-    last: Optional[Exception] = None
-    for i in range(attempts):
-        try:
-            r = requests.get(url, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last = e
-            if i == attempts - 1 or not _is_retryable_http(e):
-                raise
-            time_mod.sleep(1.25 * (i + 1))
-    raise last  # pragma: no cover
-
-
-def _utc_iso_from_any(s: Optional[str]) -> Optional[str]:
-    if not s or not isinstance(s, str):
-        return None
-    # NWS typically returns ISO timestamps already; keep as-is
-    return s
-
-
-def _station_to_climate_site(station_id: str) -> str:
-    # Common case: ICAO KXXX => climate site XXX
-    if station_id and station_id.startswith("K") and len(station_id) == 4:
-        return station_id[1:]
-    return station_id
-
-
-def _get_cwa_for_station(lat: float, lon: float) -> str:
-    # NWS points endpoint returns properties.cwa (forecast office / CWA)
+def _get_cwa(lat: float, lon: float) -> str:
     url = f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}"
     headers = dict(HEADERS)
     headers["Accept"] = "application/geo+json"
-    payload = _get_json_with_retry(url, headers=headers, timeout=20, attempts=3)
+    payload = _get_json(url, headers=headers, timeout=20, attempts=3)
     props = payload.get("properties") or {}
     cwa = props.get("cwa")
     if not cwa:
@@ -104,110 +70,107 @@ def _get_cwa_for_station(lat: float, lon: float) -> str:
     return str(cwa).strip().upper()
 
 
-def _list_cli_products_for_cwa(cwa: str, *, limit: int = 25) -> List[dict]:
-    # List CLI products issued by this office
-    # Endpoint exists per NWS API spec (products by type + location). :contentReference[oaicite:2]{index=2}
+def _list_cli_products(cwa: str, limit: int = 40) -> List[dict]:
     url = f"https://api.weather.gov/products/types/CLI/locations/{cwa}"
     headers = dict(HEADERS)
     headers["Accept"] = "application/ld+json"
-    payload = _get_json_with_retry(url, headers=headers, params={"limit": limit}, timeout=25, attempts=3)
-
-    # NWS JSON-LD collections commonly expose items under @graph
+    payload = _get_json(url, headers=headers, params={"limit": limit}, timeout=25, attempts=3)
     items = payload.get("@graph")
-    if isinstance(items, list):
-        return [x for x in items if isinstance(x, dict)]
-    # Fallback
-    items = payload.get("graph") or payload.get("items")
-    if isinstance(items, list):
-        return [x for x in items if isinstance(x, dict)]
-    return []
+    return [x for x in items if isinstance(x, dict)] if isinstance(items, list) else []
 
 
-def _fetch_product_text_and_issued_at(product_id_or_url: str) -> Tuple[Optional[str], Optional[str]]:
-    # product_id_or_url may be full URL or ID; normalize to URL
-    if product_id_or_url.startswith("http"):
-        url = product_id_or_url
-    else:
-        url = f"https://api.weather.gov/products/{product_id_or_url}"
-
+def _fetch_product(product_id_or_url: str) -> Tuple[str, Optional[str]]:
+    url = product_id_or_url if product_id_or_url.startswith("http") else f"https://api.weather.gov/products/{product_id_or_url}"
     headers = dict(HEADERS)
     headers["Accept"] = "application/ld+json"
-    payload = _get_json_with_retry(url, headers=headers, timeout=25, attempts=3)
+    payload = _get_json(url, headers=headers, timeout=25, attempts=3)
 
-    issued_at = _utc_iso_from_any(payload.get("issuanceTime") or payload.get("issueTime") or payload.get("issuedAt"))
-    text = payload.get("productText") or payload.get("text") or payload.get("product_text")
-    if not isinstance(text, str):
-        text = None
-    return text, issued_at
+    text = payload.get("productText") or payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("product missing productText")
+
+    issued_at = payload.get("issuanceTime") or payload.get("issueTime") or payload.get("issuedAt")
+    return text, issued_at if isinstance(issued_at, str) else None
 
 
-def _parse_cli_max_min_f(cli_text: str) -> Optional[Tuple[float, float]]:
-    """
-    CLI (Daily Climate Report) formats vary a bit by office.
-    Try several patterns that show up commonly.
-    """
-    t = cli_text
-
-    patterns_max = [
-        r"MAXIMUM(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)",
-        r"MAX(?:IMUM)?\s+TEMP(?:ERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)",
-        r"HIGH(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)",
+def _parse_cli_max_min(text: str) -> Optional[Tuple[float, float]]:
+    # Common CLI variants across offices
+    max_patterns = [
+        r"\bMAXIMUM(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
+        r"\bMAX(?:IMUM)?\s+TEMP(?:ERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
+        r"\bHIGH(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
     ]
-    patterns_min = [
-        r"MINIMUM(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)",
-        r"MIN(?:IMUM)?\s+TEMP(?:ERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)",
-        r"LOW(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)",
+    min_patterns = [
+        r"\bMINIMUM(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
+        r"\bMIN(?:IMUM)?\s+TEMP(?:ERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
+        r"\bLOW(?:\s+TEMPERATURE)?\s*[:\-]\s*([\-]?\d+(?:\.\d+)?)\b",
     ]
 
-    max_v: Optional[float] = None
-    min_v: Optional[float] = None
+    hi: Optional[float] = None
+    lo: Optional[float] = None
 
-    for p in patterns_max:
-        m = re.search(p, t, flags=re.IGNORECASE)
+    for p in max_patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
         if m:
             try:
-                max_v = float(m.group(1))
+                hi = float(m.group(1))
                 break
             except ValueError:
                 pass
 
-    for p in patterns_min:
-        m = re.search(p, t, flags=re.IGNORECASE)
+    for p in min_patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
         if m:
             try:
-                min_v = float(m.group(1))
+                lo = float(m.group(1))
                 break
             except ValueError:
                 pass
 
-    if max_v is None or min_v is None:
+    if hi is None or lo is None:
+        return None
+    return round(hi, 1), round(lo, 1)
+
+
+def _parse_cli_report_date(text: str) -> Optional[str]:
+    # Many CLI products include a header like "CLIMATE SUMMARY FOR ... <Month> <DD> <YYYY>"
+    # We use this as a weak validation so we don't ingest a report for the wrong day.
+    m = re.search(r"\bCLIMATE SUMMARY(?:.*?)\b(\w+\s+\d{1,2}\s+\d{4})\b", text, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1), "%B %d %Y").date()
+        return dt.isoformat()
+    except Exception:
         return None
 
-    # If the report is in whole °F already, keep. If you ever see °C values here, add conversion.
-    return round(max_v, 1), round(min_v, 1)
 
+def _fallback_station_obs(station: dict, target_date: str) -> Optional[Tuple[float, float]]:
+    station_id = station["station_id"]
+    target = date.fromisoformat(target_date)
+    tz = ZoneInfo(station.get("timezone") or "UTC")
 
-def _find_best_cli_for_target_date(items: List[dict], target_date: str) -> Optional[str]:
-    """
-    Pick a likely candidate product id/url.
-    Minimal strategy: take newest first (API is typically newest-first),
-    and try until we find one that parses.
-    """
-    for it in items:
-        pid = it.get("id") or it.get("@id") or it.get("productId")
-        if isinstance(pid, str) and pid.strip():
-            return pid.strip()
-    return None
+    start_local = datetime.combine(target, time(0, 0), tzinfo=tz)
+    end_local = datetime.combine(target, time(23, 59), tzinfo=tz)
+    start_utc = start_local.astimezone(ZoneInfo("UTC")).isoformat()
+    end_utc = end_local.astimezone(ZoneInfo("UTC")).isoformat()
 
+    url = f"https://api.weather.gov/stations/{station_id}/observations"
+    params = {"start": start_utc, "end": end_utc, "limit": 500}
+    headers = dict(HEADERS)
+    headers["Accept"] = "application/geo+json"
 
-# ----------------------------
-# Main entry points
-# ----------------------------
+    payload = _get_json(url, headers=headers, params=params, timeout=25, attempts=3)
+    feats = payload.get("features", [])
+    temps_f = _extract_temps_f(feats)
+    if not temps_f:
+        return None
+    return round(max(temps_f), 1), round(min(temps_f), 1)
+
 
 def fetch_observations_for_station(station: dict, target_date: str) -> bool:
     station_id = station["station_id"]
 
-    # Keep locations table up to date (idempotent)
     upsert_location({
         "station_id": station_id,
         "name": station.get("name"),
@@ -221,93 +184,75 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
 
     lat = station.get("lat")
     lon = station.get("lon")
+    cli_site = (station.get("cli_site") or (station_id[1:] if station_id.startswith("K") and len(station_id) == 4 else station_id)).upper()
 
-    # --- Option A: CLI text product (official daily climate report) ---
+    # CLI path
     try:
         if lat is None or lon is None:
-            raise ValueError("station missing lat/lon (needed to derive CWA for CLI lookup)")
+            raise ValueError("missing lat/lon (required for CLI lookup)")
 
-        cwa = _get_cwa_for_station(float(lat), float(lon))
-        items = _list_cli_products_for_cwa(cwa, limit=25)
-        pid = _find_best_cli_for_target_date(items, target_date)
-        if not pid:
-            raise ValueError(f"no CLI products returned for CWA={cwa}")
+        cwa = _get_cwa(float(lat), float(lon))
+        items = _list_cli_products(cwa, limit=40)
+        if not items:
+            raise ValueError(f"no CLI products for CWA={cwa}")
 
-        # Try a few products until one parses
-        for _ in range(6):
-            text, issued_at = _fetch_product_text_and_issued_at(pid)
-            if text:
-                parsed = _parse_cli_max_min_f(text)
-                if parsed:
-                    high, low = parsed
-                    upsert_observation(
-                        station_id=station_id,
-                        obs_date=target_date,
-                        observed_high=high,
-                        observed_low=low,
-                        issued_at=issued_at,
-                        raw_text=text,
-                        source="NWS_CLI",
-                    )
-                    print(f"[obs] OK {station_id} {target_date}: high={high} low={low} (CLI)")
-                    return True
+        # Try newest products; select ones whose product name/ID hints at the site, then parse text
+        tried = 0
+        for it in items[:20]:
+            pid = it.get("id") or it.get("@id")
+            if not isinstance(pid, str) or not pid.strip():
+                continue
 
-            # If it didn't parse, try next product in the listing (if present)
-            # (very simple: move to next item)
-            idx = next((i for i, it in enumerate(items) if (it.get("id") or it.get("@id")) == pid), None)
-            if idx is not None and idx + 1 < len(items):
-                pid = (items[idx + 1].get("id") or items[idx + 1].get("@id") or "").strip()
-                if not pid:
-                    break
-            else:
-                break
+            text, issued_at = _fetch_product(pid.strip())
 
-        raise ValueError("CLI fetched but could not parse max/min from productText")
+            # Filter to the correct climate site if possible (CLI text usually contains it)
+            # This keeps you from accidentally ingesting a different city’s CLI from the same CWA.
+            if cli_site not in text:
+                continue
 
-    except Exception as e:
-        # Optional fallback: keep data continuity if CLI fails
-        # You can delete this entire block if you want CLI-only strictness.
-        try:
-            target = date.fromisoformat(target_date)
-            tz = ZoneInfo(station.get("timezone") or "UTC")
+            report_date = _parse_cli_report_date(text)
+            if report_date and report_date != target_date:
+                continue
 
-            start_local = datetime.combine(target, time(0, 0), tzinfo=tz)
-            end_local = datetime.combine(target, time(23, 59), tzinfo=tz)
-            start_utc = start_local.astimezone(ZoneInfo("UTC")).isoformat()
-            end_utc = end_local.astimezone(ZoneInfo("UTC")).isoformat()
+            parsed = _parse_cli_max_min(text)
+            if not parsed:
+                tried += 1
+                continue
 
-            url = f"https://api.weather.gov/stations/{station_id}/observations"
-            params = {"start": start_utc, "end": end_utc, "limit": 500}
-
-            headers = dict(HEADERS)
-            headers["Accept"] = "application/geo+json"
-
-            payload = _get_json_with_retry(url, headers=headers, params=params, timeout=25, attempts=3)
-            feats = payload.get("features", [])
-            temps_f = _extract_temps_f(feats)
-
-            if not temps_f:
-                print(f"[obs] FAIL {station_id} {target_date}: CLI failed ({e}); obs fallback: no temps")
-                return False
-
-            high = round(max(temps_f), 1)
-            low = round(min(temps_f), 1)
-
+            high, low = parsed
             upsert_observation(
                 station_id=station_id,
                 obs_date=target_date,
                 observed_high=high,
                 observed_low=low,
-                issued_at=None,
-                raw_text=None,
-                source="NWS_OBS_FALLBACK",
+                issued_at=issued_at,
+                raw_text=text,
+                source="NWS_CLI",
             )
-            print(f"[obs] OK {station_id} {target_date}: high={high} low={low} (fallback; CLI failed: {e})")
+            print(f"[obs] OK {station_id} {target_date}: high={high} low={low} (CLI)")
             return True
 
-        except Exception as e2:
-            print(f"[obs] FAIL {station_id} {target_date}: CLI failed ({e}); fallback failed ({e2})")
+        raise ValueError(f"no parseable CLI found (filtered by cli_site={cli_site})")
+
+    except Exception as e:
+        # Fallback (recommended, because CLI is not guaranteed for every site/day)
+        fb = _fallback_station_obs(station, target_date)
+        if not fb:
+            print(f"[obs] FAIL {station_id} {target_date}: CLI failed ({e}); fallback failed")
             return False
+
+        high, low = fb
+        upsert_observation(
+            station_id=station_id,
+            obs_date=target_date,
+            observed_high=high,
+            observed_low=low,
+            issued_at=None,
+            raw_text=None,
+            source="NWS_OBS_FALLBACK",
+        )
+        print(f"[obs] OK {station_id} {target_date}: high={high} low={low} (fallback; CLI failed: {e})")
+        return True
 
 
 def fetch_observations(target_date: str) -> bool:
