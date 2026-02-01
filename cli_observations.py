@@ -64,19 +64,6 @@ def _get_json(
             time_mod.sleep(1.25 * (i + 1))
     raise last  # pragma: no cover
 
-
-def _get_cwa(lat: float, lon: float) -> str:
-    url = f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}"
-    headers = dict(HEADERS)
-    headers["Accept"] = "application/geo+json"
-    payload = _get_json(url, headers=headers, timeout=20, attempts=3)
-    props = payload.get("properties") or {}
-    cwa = props.get("cwa")
-    if not cwa:
-        raise ValueError("NWS points endpoint missing properties.cwa")
-    return str(cwa).strip().upper()
-
-
 def _fetch_product(product_id_or_url: str) -> Tuple[str, Optional[str]]:
     url = (
         product_id_or_url
@@ -255,8 +242,12 @@ def _list_cli_products(location_id: str, limit: int = 50) -> List[dict]:
     url = f"https://api.weather.gov/products/types/CLI/locations/{location_id}"
     headers = dict(HEADERS)
     headers["Accept"] = "application/ld+json"
-    payload = _get_json(url, headers=headers, params={"limit": limit}, timeout=25, attempts=3)
-    return _extract_products_list(payload)
+
+    # NWS endpoint does NOT accept query.limit; pull all then slice locally.
+    payload = _get_json(url, headers=headers, params=None, timeout=25, attempts=3)
+    items = _extract_products_list(payload)
+
+    return items[:limit]
 
 
 def _issuance_sort_key(it: dict) -> str:
@@ -375,3 +366,4 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
+
