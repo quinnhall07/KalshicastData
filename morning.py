@@ -135,6 +135,7 @@ def _normalize_payload(raw: Any, *, fallback_issued_at: str) -> Tuple[str, List[
         if not isinstance(rows, list):
             raise ValueError("payload dict must include rows: list[dict]")
         raw = rows
+        print("[DEBUG raw full dict]", json.dumps(raw, default=str)[:4000], flush=True)
 
     if not isinstance(raw, list):
         raise ValueError(f"fetcher returned {type(raw)}; expected list[dict] or dict")
@@ -330,3 +331,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
