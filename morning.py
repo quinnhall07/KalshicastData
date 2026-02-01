@@ -1,5 +1,6 @@
 # morning.py
 from __future__ import annotations
+
 import concurrent.futures
 import json
 import random
@@ -7,6 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 import threading
+
 import requests
 
 from config import STATIONS
@@ -16,12 +18,10 @@ from db import (
     init_db,
     upsert_location,
     get_or_create_forecast_run,
-    upsert_forecast_value,
     compute_revisions_for_run,
     get_conn,
     bulk_upsert_forecast_values,
 )
-
 
 MAX_ATTEMPTS = 4
 BASE_SLEEP_SECONDS = 1.0
@@ -71,9 +71,6 @@ def _is_retryable_error(e: Exception) -> bool:
         "gateway timeout", "too many requests", "rate limit",
     ])
 
-
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-
 def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
     last_exc: Exception | None = None
     sem = _PROVIDER_LIMITS.get(_provider_key(source_id))
@@ -91,41 +88,34 @@ def _call_fetcher_with_retry(fetcher, station: dict, source_id: str) -> Any:
                 raise
 
             msg = str(e).lower()
-            is_429 = "429" in msg or "too many requests" in msg or "rate limit" in msg
-            sleep_s = (10.0 + random.random() * 5.0) if is_429 else min(5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5)
+            is_429 = ("429" in msg) or ("too many requests" in msg) or ("rate limit" in msg)
+            sleep_s = (10.0 + random.random() * 5.0) if is_429 else min(
+                5.0, (BASE_SLEEP_SECONDS * attempt) + random.random() * 0.5
+            )
 
             print(f"[morning] RETRY {station['station_id']} {source_id} attempt {attempt}/{MAX_ATTEMPTS}: {e}", flush=True)
             time.sleep(sleep_s)
 
-    raise last_exc
+    raise last_exc  # pragma: no cover
 
-
-
-def _fetch_one(st: dict, source_id: str, fetcher):
-    station_id = st["station_id"]
-    try:
-        raw = _call_fetcher_with_retry(fetcher, st, source_id)
-        issued_at, rows = _normalize_payload(raw)
-        return (station_id, st, source_id, issued_at, rows, None)
-    except Exception as e:
-        return (station_id, st, source_id, None, [], e)
-    
-
-def _normalize_payload(raw: Any) -> Tuple[str, List[Dict[str, Any]]]:
+def _normalize_payload(raw: Any, *, fallback_issued_at: str) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Accept:
       - old: list[{target_date, high, low, ...extras}]
       - new: {issued_at: "...Z", rows: [...]}
 
     Returns (issued_at_utc_iso, rows)
+
+    fallback_issued_at MUST be stable for the whole workflow run to avoid
+    run fragmentation (multiple runs for the same provider in one workflow).
     """
-    issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    issued_at = fallback_issued_at
 
     if raw is None:
         return issued_at, []
 
     if isinstance(raw, dict):
-        if isinstance(raw.get("issued_at"), str):
+        if isinstance(raw.get("issued_at"), str) and raw["issued_at"].strip():
             issued_at = raw["issued_at"]
         rows = raw.get("rows")
         if not isinstance(rows, list):
@@ -136,11 +126,12 @@ def _normalize_payload(raw: Any) -> Tuple[str, List[Dict[str, Any]]]:
         raise ValueError(f"fetcher returned {type(raw)}; expected list[dict] or dict")
 
     out: List[Dict[str, Any]] = []
-    for i, r in enumerate(raw):
+    for r in raw:
         if not isinstance(r, dict):
             continue
         if "target_date" not in r or "high" not in r or "low" not in r:
             continue
+
         td = str(r["target_date"])[:10]
         high = _coerce_float(r["high"])
         low = _coerce_float(r["low"])
@@ -154,6 +145,14 @@ def _normalize_payload(raw: Any) -> Tuple[str, List[Dict[str, Any]]]:
 
     return issued_at, out
 
+def _fetch_one(st: dict, source_id: str, fetcher, fallback_issued_at: str):
+    station_id = st["station_id"]
+    try:
+        raw = _call_fetcher_with_retry(fetcher, st, source_id)
+        issued_at, rows = _normalize_payload(raw, fallback_issued_at=fallback_issued_at)
+        return (station_id, st, source_id, issued_at, rows, None)
+    except Exception as e:
+        return (station_id, st, source_id, None, [], e)
 
 def main() -> None:
     init_db()
@@ -166,11 +165,21 @@ def main() -> None:
         print("[morning] ERROR: no enabled sources loaded (check config.SOURCES).", flush=True)
         return
 
-    tasks = []
+    # Stable fallback issued_at for this entire workflow run (prevents run fragmentation)
+    fallback_issued_at = (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+    tasks: List[concurrent.futures.Future] = []
+    touched_run_ids: set[Any] = set()
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
         for st in STATIONS:
             for source_id, fetcher in fetchers.items():
-                tasks.append(ex.submit(_fetch_one, st, source_id, fetcher))
+                tasks.append(ex.submit(_fetch_one, st, source_id, fetcher, fallback_issued_at))
 
         # ONE shared DB connection for the write phase (fast)
         with get_conn() as conn:
@@ -185,15 +194,15 @@ def main() -> None:
                     print(f"[morning] WARN {station_id} {source_id}: no rows", flush=True)
                     continue
 
-                # Create/get run_id
-                run_id = get_or_create_forecast_run(source=source_id, issued_at=issued_at)
+                # IMPORTANT: use shared conn here
+                run_id = get_or_create_forecast_run(source=source_id, issued_at=issued_at, conn=conn)
+                touched_run_ids.add(run_id)
 
                 # Build a batch (2 rows per target_date: high + low)
-                batch = []
+                batch: List[Dict[str, Any]] = []
                 for r in rows:
                     td = r["target_date"]
                     extras = r.get("extras") or {}
-                    extras_json = json.dumps(extras)
 
                     lead_high = compute_lead_hours(
                         station_tz=st["timezone"],
@@ -208,8 +217,6 @@ def main() -> None:
                         kind="low",
                     )
 
-                    extras = r.get("extras") or {}
-                    
                     batch.append({
                         "run_id": run_id,
                         "station_id": station_id,
@@ -217,19 +224,15 @@ def main() -> None:
                         "kind": "high",
                         "value_f": r["high"],
                         "lead_hours": lead_high,
-                    
-                        # dedicated predictor columns
                         "dewpoint_f": extras.get("dewpoint_f"),
                         "humidity_pct": extras.get("humidity_pct"),
                         "wind_speed_mph": extras.get("wind_speed_mph"),
                         "wind_dir_deg": extras.get("wind_dir_deg"),
                         "cloud_cover_pct": extras.get("cloud_cover_pct"),
                         "precip_prob_pct": extras.get("precip_prob_pct"),
-                    
-                        # jsonb column
                         "extras": json.dumps(extras),
                     })
-                    
+
                     batch.append({
                         "run_id": run_id,
                         "station_id": station_id,
@@ -237,46 +240,32 @@ def main() -> None:
                         "kind": "low",
                         "value_f": r["low"],
                         "lead_hours": lead_low,
-                    
                         "dewpoint_f": extras.get("dewpoint_f"),
                         "humidity_pct": extras.get("humidity_pct"),
                         "wind_speed_mph": extras.get("wind_speed_mph"),
                         "wind_dir_deg": extras.get("wind_dir_deg"),
                         "cloud_cover_pct": extras.get("cloud_cover_pct"),
                         "precip_prob_pct": extras.get("precip_prob_pct"),
-                    
                         "extras": json.dumps(extras),
                     })
-                
-                
-                # Batched write (single round trip)
+
                 wrote = bulk_upsert_forecast_values(conn, batch)
                 conn.commit()
-
                 print(f"[morning] OK {station_id} {source_id}: wrote {wrote} rows issued_at={issued_at}", flush=True)
 
-                # Revisions (optional but keep it here for now)
-                try:
-                    wrote_rev = compute_revisions_for_run(run_id)
-                    if wrote_rev:
-                        conn.commit()
-                        print(f"[morning] revisions {station_id} {source_id}: {wrote_rev}", flush=True)
-                except Exception as e:
-                    print(f"[morning] revisions FAIL {station_id} {source_id}: {e}", flush=True)
+            # Revisions: compute ONCE per run_id (not per station)
+            if touched_run_ids:
+                for run_id in sorted(touched_run_ids, key=lambda x: str(x)):
+                    try:
+                        wrote_rev = compute_revisions_for_run(run_id)
+                        if wrote_rev:
+                            conn.commit()
+                            print(f"[morning] revisions run_id={run_id}: {wrote_rev}", flush=True)
+                    except Exception as e:
+                        print(f"[morning] revisions FAIL run_id={run_id}: {e}", flush=True)
 
-                # Provider throttle (only after successful processing)
-                if source_id.startswith("OME_"):
-                    time.sleep(0.4 + random.random() * 0.6)
-
+    # Provider throttle isn't needed here anymore because we already throttle in fetch.
+    # If you still want extra Open-Meteo pacing, implement it inside the fetcher itself.
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
