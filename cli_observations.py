@@ -35,7 +35,7 @@ def _extract_temps_f(features: List[dict]) -> List[float]:
 def fetch_observations_for_station(station: dict, target_date: str) -> bool:
     station_id = station["station_id"]
 
-    upsert_station(
+    upsert_location(
         station_id=station_id,
         name=station.get("name"),
         lat=station.get("lat"),
@@ -98,4 +98,5 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
+
 
