@@ -6,10 +6,25 @@ from typing import Any, Callable, Dict
 
 from config import SOURCES
 
+# A fetcher returns either:
+#  - list[dict]                              (legacy daily rows)
+#  - dict with keys:
+#       issued_at: str
+#       rows: list[dict]                    (daily)
+#       hourly_rows OR hourly (optional)    (hourly, unaggregated)
 Fetcher = Callable[[dict], Any]
 
 
 def load_fetchers_safe() -> Dict[str, Fetcher]:
+    """
+    Loads enabled sources and returns a mapping:
+        source_id -> fetcher(station) -> payload
+
+    Key guarantees:
+    - params are bound correctly per source (no late-binding bug)
+    - fetchers are wrapped uniformly
+    - does NOT mutate payloads (morning.py owns normalization)
+    """
     out: Dict[str, Fetcher] = {}
 
     for source_id, spec in (SOURCES or {}).items():
@@ -23,11 +38,21 @@ def load_fetchers_safe() -> Dict[str, Fetcher]:
         mod = importlib.import_module(mod_name)
         fn = getattr(mod, fn_name)
 
+        if not callable(fn):
+            raise TypeError(f"Fetcher {mod_name}.{fn_name} is not callable")
+
+        # Bind params safely (avoid closure capture bugs)
         if params:
-            def _make_wrapped(f, p):
-                return lambda station, f=f, p=p: f(station, p)
-            out[source_id] = _make_wrapped(fn, params)
+            def make_fetcher(f, p):
+                def _fetch(station: dict):
+                    return f(station, p)
+                return _fetch
+            out[source_id] = make_fetcher(fn, params)
         else:
-            out[source_id] = fn
+            def make_fetcher(f):
+                def _fetch(station: dict):
+                    return f(station)
+                return _fetch
+            out[source_id] = make_fetcher(fn)
 
     return out
