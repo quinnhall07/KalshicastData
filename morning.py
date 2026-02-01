@@ -183,6 +183,11 @@ def _fetch_one(st: dict, source_id: str, fetcher, fallback_issued_at: str):
                 print("[debug] raw type:", type(raw), flush=True)
 
         issued_at, rows = _normalize_payload(raw, fallback_issued_at=fallback_issued_at)
+        if DEBUG_DUMP and source_id == DEBUG_SOURCE and station_id == DEBUG_STATION:
+            if rows:
+                print("[DEBUG normalized first row]",
+                      json.dumps(rows[0], default=str)[:2000],
+                      flush=True)
         return (station_id, st, source_id, issued_at, rows, None)
     except Exception as e:
         return (station_id, st, source_id, None, [], e)
@@ -302,6 +307,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
