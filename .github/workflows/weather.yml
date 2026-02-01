@@ -21,6 +21,25 @@ on:
         type: choice
         options: [night, morning]
 
+      debug_dump:
+        description: "Enable debug prints (0/1)"
+        required: false
+        default: "0"
+        type: choice
+        options: ["0", "1"]
+
+      debug_source:
+        description: "Exact source_id to debug (e.g. OME_GFS)"
+        required: false
+        default: ""
+        type: string
+
+      debug_station:
+        description: "Exact station_id to debug (e.g. KMDW)"
+        required: false
+        default: ""
+        type: string
+
 jobs:
   morning:
     name: Run morning.py
@@ -42,6 +61,12 @@ jobs:
       TOMORROW_API_KEY: ${{ secrets.TOMORROW_API_KEY }}
       WEATHERAPI_KEY: ${{ secrets.WEATHERAPI_KEY }}
       VISUALCROSSING_KEY: ${{ secrets.VISUALCROSSING_KEY }}
+
+      # Debug envs (only populated for workflow_dispatch runs)
+      DEBUG_DUMP: ${{ github.event.inputs.debug_dump }}
+      DEBUG_SOURCE: ${{ github.event.inputs.debug_source }}
+      DEBUG_STATION: ${{ github.event.inputs.debug_station }}
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -72,6 +97,12 @@ jobs:
       TOMORROW_API_KEY: ${{ secrets.TOMORROW_API_KEY }}
       WEATHERAPI_KEY: ${{ secrets.WEATHERAPI_KEY }}
       VISUALCROSSING_KEY: ${{ secrets.VISUALCROSSING_KEY }}
+
+      # Debug envs (only populated for workflow_dispatch runs)
+      DEBUG_DUMP: ${{ github.event.inputs.debug_dump }}
+      DEBUG_SOURCE: ${{ github.event.inputs.debug_source }}
+      DEBUG_STATION: ${{ github.event.inputs.debug_station }}
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
