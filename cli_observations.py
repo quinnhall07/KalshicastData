@@ -70,15 +70,6 @@ def _get_cwa(lat: float, lon: float) -> str:
     return str(cwa).strip().upper()
 
 
-def _list_cli_products(cwa: str, limit: int = 40) -> List[dict]:
-    url = f"https://api.weather.gov/products/types/CLI/locations/{cwa}"
-    headers = dict(HEADERS)
-    headers["Accept"] = "application/ld+json"
-    payload = _get_json(url, headers=headers, params={"limit": limit}, timeout=25, attempts=3)
-    items = payload.get("@graph")
-    return [x for x in items if isinstance(x, dict)] if isinstance(items, list) else []
-
-
 def _fetch_product(product_id_or_url: str) -> Tuple[str, Optional[str]]:
     url = product_id_or_url if product_id_or_url.startswith("http") else f"https://api.weather.gov/products/{product_id_or_url}"
     headers = dict(HEADERS)
@@ -167,6 +158,17 @@ def _fallback_station_obs(station: dict, target_date: str) -> Optional[Tuple[flo
         return None
     return round(max(temps_f), 1), round(min(temps_f), 1)
 
+def _fetch_latest_cli_text(cwa: str) -> tuple[str, Optional[str]]:
+    url = f"https://api.weather.gov/products/types/CLI/locations/{cwa}/latest"
+    headers = dict(HEADERS)
+    headers["Accept"] = "application/ld+json"
+    payload = _get_json(url, headers=headers, timeout=25, attempts=3)
+    text = payload.get("productText") or payload.get("text")
+    issued_at = payload.get("issuanceTime") or payload.get("issueTime") or payload.get("issuedAt")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("latest CLI missing productText")
+    return text, issued_at if isinstance(issued_at, str) else None
+
 
 def fetch_observations_for_station(station: dict, target_date: str) -> bool:
     station_id = station["station_id"]
@@ -192,47 +194,32 @@ def fetch_observations_for_station(station: dict, target_date: str) -> bool:
             raise ValueError("missing lat/lon (required for CLI lookup)")
 
         cwa = _get_cwa(float(lat), float(lon))
-        items = _list_cli_products(cwa, limit=40)
-        if not items:
-            raise ValueError(f"no CLI products for CWA={cwa}")
-
-        # Try newest products; select ones whose product name/ID hints at the site, then parse text
-        tried = 0
-        for it in items[:20]:
-            pid = it.get("id") or it.get("@id")
-            if not isinstance(pid, str) or not pid.strip():
-                continue
-
-            text, issued_at = _fetch_product(pid.strip())
-
-            # Filter to the correct climate site if possible (CLI text usually contains it)
-            # This keeps you from accidentally ingesting a different city’s CLI from the same CWA.
-            if cli_site not in text:
-                continue
-
-            report_date = _parse_cli_report_date(text)
-            if report_date and report_date != target_date:
-                continue
-
-            parsed = _parse_cli_max_min(text)
-            if not parsed:
-                tried += 1
-                continue
-
-            high, low = parsed
-            upsert_observation(
-                station_id=station_id,
-                obs_date=target_date,
-                observed_high=high,
-                observed_low=low,
-                issued_at=issued_at,
-                raw_text=text,
-                source="NWS_CLI",
-            )
-            print(f"[obs] OK {station_id} {target_date}: high={high} low={low} (CLI)")
-            return True
-
-        raise ValueError(f"no parseable CLI found (filtered by cli_site={cli_site})")
+        text, issued_at = _fetch_latest_cli_text(cwa)
+        
+        # Filter to correct climate site (keeps you from ingesting the wrong city)
+        if cli_site not in text:
+            raise ValueError(f"latest CLI not for site={cli_site}")
+        
+        report_date = _parse_cli_report_date(text)
+        if report_date and report_date != target_date:
+            raise ValueError(f"latest CLI date {report_date} != target {target_date}")
+        
+        parsed = _parse_cli_max_min(text)
+        if not parsed:
+            raise ValueError("latest CLI missing max/min")
+        
+        high, low = parsed
+        upsert_observation(
+            station_id=station_id,
+            obs_date=target_date,
+            observed_high=high,
+            observed_low=low,
+            issued_at=issued_at,
+            raw_text=text,
+            source="NWS_CLI",
+        )
+        print(f"[obs] OK {station_id} {target_date}: high={high} low={low} (CLI)")
+        return True
 
     except Exception as e:
         # Fallback (recommended, because CLI is not guaranteed for every site/day)
@@ -264,3 +251,4 @@ def fetch_observations(target_date: str) -> bool:
         except Exception as e:
             print(f"[obs] FAIL {st.get('station_id')} {target_date}: {e}")
     return any_ok
+
