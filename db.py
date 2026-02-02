@@ -638,88 +638,23 @@ def _percentile(sorted_vals: List[float], p: float) -> float:
     d1 = sorted_vals[c] * (k - f)
     return float(d0 + d1)
 
-
 def compute_revisions_for_run(run_id: Any) -> int:
     """
-    Prefer public.forecasts_daily if present; else legacy public.forecasts.
-    Writes to public.forecast_revisions (assumes it exists).
+    For all forecast rows in a run, compute delta vs previous issued_at for the same
+    (station_id, source, kind, target_date). Idempotent via PK.
+
+    NOTE: If public.forecast_revisions doesn't exist, this becomes a no-op.
     """
     conn = get_conn()
     cur = conn.cursor()
 
-    has_daily = _has_table(conn, "public.forecasts_daily")
-
-    if has_daily:
-        cur.execute(
-            """
-            select r.source, r.issued_at, d.station_id, d.target_date,
-                   d.high_f, d.low_f
-            from public.forecasts_daily d
-            join public.forecast_runs r on r.run_id = d.run_id
-            where d.run_id = %s
-            """,
-            (run_id,),
-        )
-        rows = cur.fetchall()
-        if not rows:
-            conn.close()
-            return 0
-
-        wrote = 0
-        for source, issued_at, station_id, target_date, high_f, low_f in rows:
-            # compute revisions for high/low separately
-            for kind, forecast_f in (("high", high_f), ("low", low_f)):
-                if forecast_f is None:
-                    continue
-
-                cur.execute(
-                    """
-                    select r2.issued_at,
-                           case when %s='high' then d2.high_f else d2.low_f end as prev_value
-                    from public.forecasts_daily d2
-                    join public.forecast_runs r2 on r2.run_id = d2.run_id
-                    where d2.station_id=%s
-                      and r2.source=%s
-                      and d2.target_date=%s::date
-                      and r2.issued_at < %s::timestamptz
-                    order by r2.issued_at desc
-                    limit 1
-                    """,
-                    (kind, station_id, source, target_date, issued_at),
-                )
-                prev = cur.fetchone()
-                prev_issued_at = prev[0] if prev else None
-                prev_forecast_f = float(prev[1]) if (prev and prev[1] is not None) else None
-                delta_f = (float(forecast_f) - prev_forecast_f) if prev_forecast_f is not None else None
-
-                cur.execute(
-                    """
-                    insert into public.forecast_revisions
-                      (station_id, source, kind, target_date, issued_at, forecast_f,
-                       prev_issued_at, prev_forecast_f, delta_f)
-                    values
-                      (%s,%s,%s,%s::date,%s::timestamptz,%s,%s::timestamptz,%s,%s)
-                    on conflict (station_id, source, kind, target_date, issued_at) do nothing
-                    """,
-                    (
-                        station_id,
-                        source,
-                        kind,
-                        target_date,
-                        issued_at,
-                        float(forecast_f),
-                        prev_issued_at,
-                        prev_forecast_f,
-                        delta_f,
-                    ),
-                )
-                wrote += 1
-
-        conn.commit()
+    # If the revisions table isn't present (migration mismatch), skip cleanly.
+    cur.execute("select to_regclass('public.forecast_revisions') is not null")
+    has_revisions = bool(cur.fetchone()[0])
+    if not has_revisions:
         conn.close()
-        return wrote
+        return 0
 
-    # legacy path
     cur.execute(
         """
         select r.source, r.issued_at, f.station_id, f.target_date, f.kind, f.value_f
@@ -785,7 +720,6 @@ def compute_revisions_for_run(run_id: Any) -> int:
     conn.commit()
     conn.close()
     return wrote
-
 
 def update_error_stats(*, window_days: int, station_id: Optional[str] = None) -> None:
     conn = get_conn()
@@ -872,3 +806,4 @@ def update_error_stats(*, window_days: int, station_id: Optional[str] = None) ->
 
     conn.commit()
     conn.close()
+
