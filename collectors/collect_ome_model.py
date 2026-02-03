@@ -12,21 +12,23 @@ from config import HEADERS
 
 OME_URL = "https://api.open-meteo.com/v1/forecast"
 
-# Strict collector payload shape:
-# {
-#   "issued_at": "...Z",
-#   "daily": [ {"target_date":"YYYY-MM-DD","high":float,"low":float}, ... ],
-#   "hourly": [
-#      {"valid_time":"YYYY-MM-DDTHH:MM","temperature_f":float|None,"dewpoint_f":float|None,
-#       "humidity_pct":float|None,"wind_speed_mph":float|None,"wind_dir_deg":float|None,
-#       "cloud_cover_pct":float|None,"precip_prob_pct":float|None},
-#      ...
-#   ]
-# }
+"""
+Collector contract REQUIRED by morning.py:
+
+{
+  "issued_at": "2026-02-01T06:00:00Z",
+  "daily": [ {"target_date":"YYYY-MM-DD","high_f":float,"low_f":float}, ... ],
+  "hourly": { "time":[...], optional variable arrays ... }  # Open-Meteo style arrays
+}
+
+For Open-Meteo, there is no reliable provider-issued timestamp for a forecast “run”.
+Permanent decision: issued_at = fetch time truncated to the hour (UTC).
+"""
 
 
-def _utc_now_z() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def _utc_now_trunc_hour_z() -> str:
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    return now.isoformat().replace("+00:00", "Z")
 
 
 def _to_float(x: Any) -> Optional[float]:
@@ -41,19 +43,45 @@ def _to_float(x: Any) -> Optional[float]:
         return None
 
 
+def _ensure_time_z(ts: Any) -> Optional[str]:
+    """
+    Open-Meteo hourly time is typically "YYYY-MM-DDTHH:MM" in UTC (no tz).
+    Convert to "YYYY-MM-DDTHH:MM:00Z" so Postgres ::timestamptz is unambiguous.
+    """
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    s = ts.strip()
+    # If already has timezone info, normalize via fromisoformat when possible.
+    try:
+        if s.endswith("Z"):
+            dt = datetime.fromisoformat(s[:-1] + "+00:00")
+        else:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        return dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        # Fallback: minimal fix for "YYYY-MM-DDTHH:MM"
+        if len(s) >= 16 and s[10] == "T":
+            return s[:16] + ":00Z"
+        return None
+
+
 def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Open-Meteo multi-model collector.
+    Open-Meteo multi-model collector (non-base models).
 
-    Expects params to include:
-      - model: str (e.g., "gfs_seamless", "ecmwf_ifs04", etc.)
-        or caller passes any other Open-Meteo-supported query params.
+    Expects params to include model selection, e.g.:
+      {"model": "gfs_seamless"} or {"models": "icon_seamless"} depending on Open-Meteo API.
 
-    Collects:
-      - daily highs/lows (temperature_2m_max/min) when available
-      - hourly series (temperature, dewpoint, humidity, wind, cloud cover, precip prob)
+    Also supports:
+      - days_ahead: int (default 3; clamped 1..7)
 
-    Defaults to today..today+3 (3 days ahead). days_ahead can be overridden via params.
+    Returns:
+      - daily highs/lows in F: high_f/low_f
+      - hourly arrays object (Open-Meteo native arrays), optionally renamed to standardized keys
+        (morning.py can read either standardized keys or Open-Meteo raw names).
     """
     lat = station.get("lat")
     lon = station.get("lon")
@@ -73,7 +101,6 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
     start = date.today()
     end = start + timedelta(days=days_ahead)
 
-    # Daily + Hourly in one call.
     q: Dict[str, Any] = {
         "latitude": float(lat),
         "longitude": float(lon),
@@ -82,9 +109,7 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
         "end_date": end.isoformat(),
         "temperature_unit": "fahrenheit",
         "wind_speed_unit": "mph",
-        # Daily highs/lows
         "daily": "temperature_2m_max,temperature_2m_min",
-        # Hourly extras
         "hourly": ",".join(
             [
                 "temperature_2m",
@@ -97,8 +122,6 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
             ]
         ),
     }
-
-    # Merge caller params (e.g., model selection)
     q.update(p)
 
     r = requests.get(OME_URL, params=q, headers=dict(HEADERS), timeout=25)
@@ -108,7 +131,7 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
     if data.get("error"):
         raise RuntimeError(f"Open-Meteo error: {data.get('reason') or data.get('message') or data}")
 
-    issued_at = _utc_now_z()
+    issued_at = _utc_now_trunc_hour_z()
 
     # -------- Daily --------
     daily_rows: List[Dict[str, Any]] = []
@@ -116,18 +139,18 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
     d_time = daily.get("time") or []
     d_hi = daily.get("temperature_2m_max") or []
     d_lo = daily.get("temperature_2m_min") or []
+
     if isinstance(d_time, list) and isinstance(d_hi, list) and isinstance(d_lo, list):
         n = min(len(d_time), len(d_hi), len(d_lo))
         for i in range(n):
             td = str(d_time[i])[:10]
-            try:
-                high = float(d_hi[i])
-                low = float(d_lo[i])
-            except Exception:
+            hi = _to_float(d_hi[i])
+            lo = _to_float(d_lo[i])
+            if hi is None or lo is None:
                 continue
-            daily_rows.append({"target_date": td, "high": high, "low": low})
+            daily_rows.append({"target_date": td, "high_f": float(hi), "low_f": float(lo)})
 
-    # If daily not present, derive from hourly temperature_2m
+    # If daily missing, derive from hourly temperature_2m
     if not daily_rows:
         hourly = data.get("hourly") or {}
         h_time = hourly.get("time") or []
@@ -143,41 +166,29 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
             for td, vals in sorted(by_day.items()):
                 if not vals:
                     continue
-                daily_rows.append({"target_date": td, "high": max(vals), "low": min(vals)})
+                daily_rows.append({"target_date": td, "high_f": max(vals), "low_f": min(vals)})
 
-    # -------- Hourly --------
-    hourly_rows: List[Dict[str, Any]] = []
-    hourly = data.get("hourly") or {}
-    t = hourly.get("time") or []
-    temp = hourly.get("temperature_2m") or []
-    dew = hourly.get("dew_point_2m") or []
-    rh = hourly.get("relative_humidity_2m") or []
-    ws = hourly.get("wind_speed_10m") or []
-    wd = hourly.get("wind_direction_10m") or []
-    cc = hourly.get("cloud_cover") or []
-    pp = hourly.get("precipitation_probability") or []
+    # -------- Hourly (arrays object) --------
+    out: Dict[str, Any] = {"issued_at": issued_at, "daily": daily_rows}
 
-    if isinstance(t, list) and t:
-        n = len(t)
+    hourly = data.get("hourly")
+    if isinstance(hourly, dict):
+        times = hourly.get("time")
+        if isinstance(times, list) and times:
+            # Normalize time strings to "...Z" so timestamptz cast is unambiguous.
+            tz_times: List[str] = []
+            for t in times:
+                tz = _ensure_time_z(t)
+                if tz is None:
+                    # Skip invalid timestamps; maintain alignment by dropping corresponding indices is messy,
+                    # so if we hit invalid, just omit hourly entirely.
+                    tz_times = []
+                    break
+                tz_times.append(tz)
 
-        def _at(arr: Any, i: int) -> Optional[float]:
-            if not isinstance(arr, list) or i >= len(arr):
-                return None
-            return _to_float(arr[i])
+            if tz_times:
+                hourly_norm: Dict[str, Any] = dict(hourly)
+                hourly_norm["time"] = tz_times
+                out["hourly"] = hourly_norm
 
-        for i in range(n):
-            vt = str(t[i])[:16]  # "YYYY-MM-DDTHH:MM"
-            hourly_rows.append(
-                {
-                    "valid_time": vt,
-                    "temperature_f": _at(temp, i),
-                    "dewpoint_f": _at(dew, i),
-                    "humidity_pct": _at(rh, i),
-                    "wind_speed_mph": _at(ws, i),
-                    "wind_dir_deg": _at(wd, i),
-                    "cloud_cover_pct": _at(cc, i),
-                    "precip_prob_pct": _at(pp, i),
-                }
-            )
-
-    return {"issued_at": issued_at, "daily": daily_rows, "hourly": hourly_rows}
+    return out
