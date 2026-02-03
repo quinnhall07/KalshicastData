@@ -1,11 +1,9 @@
-# db.py (Supabase-only) — UPDATED for forecasts_daily + forecast_extras_hourly (+ legacy fallback)
+# db.py (Supabase-only) — REFAC (no legacy) :contentReference[oaicite:0]{index=0}
 from __future__ import annotations
 
 import os
-import json
 from typing import Any, Dict, List, Optional, Tuple
 
-from etl_utils import utc_now_z
 
 # -------------------------
 # Connection / init
@@ -29,15 +27,10 @@ def get_conn():
 
 
 def init_db() -> None:
-    conn = get_conn()
-    conn.close()
-
-
-def _has_table(conn, fq_table: str) -> bool:
-    # fq_table like "public.forecasts_daily"
-    with conn.cursor() as cur:
-        cur.execute("select to_regclass(%s) is not null", (fq_table,))
-        return bool(cur.fetchone()[0])
+    # Schema created via migrations. This just validates connectivity.
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("select 1;")
 
 
 # -------------------------
@@ -45,62 +38,184 @@ def _has_table(conn, fq_table: str) -> bool:
 # -------------------------
 
 def upsert_location(station: dict) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into public.locations
+                  (station_id, name, state, timezone, lat, lon, elevation_ft, is_active)
+                values
+                  (%s,%s,%s,%s,%s,%s,%s,%s)
+                on conflict (station_id) do update set
+                  name=coalesce(excluded.name, public.locations.name),
+                  state=coalesce(excluded.state, public.locations.state),
+                  timezone=coalesce(excluded.timezone, public.locations.timezone),
+                  lat=coalesce(excluded.lat, public.locations.lat),
+                  lon=coalesce(excluded.lon, public.locations.lon),
+                  elevation_ft=coalesce(excluded.elevation_ft, public.locations.elevation_ft),
+                  is_active=coalesce(excluded.is_active, public.locations.is_active)
+                """,
+                (
+                    station["station_id"],
+                    station.get("name"),
+                    station.get("state"),
+                    station.get("timezone"),
+                    station.get("lat"),
+                    station.get("lon"),
+                    station.get("elevation_ft"),
+                    station.get("is_active", True),
+                ),
+            )
+        conn.commit()
 
-    cur.execute(
-        """
-        insert into public.locations (station_id, name, state, timezone, lat, lon, elevation_ft, is_active)
-        values (%s,%s,%s,%s,%s,%s,%s,%s)
-        on conflict (station_id) do update set
-          name=coalesce(excluded.name, public.locations.name),
-          state=coalesce(excluded.state, public.locations.state),
-          timezone=coalesce(excluded.timezone, public.locations.timezone),
-          lat=coalesce(excluded.lat, public.locations.lat),
-          lon=coalesce(excluded.lon, public.locations.lon),
-          elevation_ft=coalesce(excluded.elevation_ft, public.locations.elevation_ft),
-          is_active=coalesce(excluded.is_active, public.locations.is_active)
-        """,
-        (
-            station["station_id"],
-            station.get("name"),
-            station.get("state"),
-            station.get("timezone"),
-            station.get("lat"),
-            station.get("lon"),
-            station.get("elevation_ft"),
-            station.get("is_active", True),
-        ),
+
+# -------------------------
+# Forecast runs
+# -------------------------
+
+def get_or_create_forecast_run(*, source: str, issued_at: str, fetched_at: Optional[str] = None, conn=None) -> Any:
+    """
+    Requires: public.forecast_runs(run_id uuid pk, source text, issued_at timestamptz, fetched_at timestamptz)
+    Recommended: UNIQUE (source, issued_at) for idempotency.
+    """
+    owns = False
+    if conn is None:
+        conn = get_conn()
+        owns = True
+
+    try:
+        with conn.cursor() as cur:
+            if fetched_at:
+                cur.execute(
+                    """
+                    insert into public.forecast_runs (source, issued_at, fetched_at)
+                    values (%s, %s::timestamptz, %s::timestamptz)
+                    on conflict (source, issued_at) do update set
+                      fetched_at = excluded.fetched_at
+                    returning run_id
+                    """,
+                    (source, issued_at, fetched_at),
+                )
+            else:
+                cur.execute(
+                    """
+                    insert into public.forecast_runs (source, issued_at)
+                    values (%s, %s::timestamptz)
+                    on conflict (source, issued_at) do update set
+                      source = excluded.source
+                    returning run_id
+                    """,
+                    (source, issued_at),
+                )
+            run_id = cur.fetchone()[0]
+        if owns:
+            conn.commit()
+        return run_id
+    finally:
+        if owns:
+            conn.close()
+
+
+# -------------------------
+# Daily forecasts (condensed)
+# -------------------------
+
+def bulk_upsert_forecasts_daily(conn, rows: List[dict]) -> int:
+    """
+    Requires: public.forecasts_daily
+      (run_id uuid, station_id text, target_date date,
+       high_f double precision, low_f double precision,
+       lead_high_hours double precision, lead_low_hours double precision,
+       primary key (run_id, station_id, target_date))
+
+    rows items:
+      run_id, station_id, target_date, high_f, low_f, lead_high_hours, lead_low_hours
+    """
+    if not rows:
+        return 0
+
+    sql = """
+    insert into public.forecasts_daily (
+      run_id, station_id, target_date,
+      high_f, low_f,
+      lead_high_hours, lead_low_hours
+    ) values (
+      %(run_id)s, %(station_id)s, %(target_date)s::date,
+      %(high_f)s, %(low_f)s,
+      %(lead_high_hours)s, %(lead_low_hours)s
     )
-
-    conn.commit()
-    conn.close()
+    on conflict (run_id, station_id, target_date)
+    do update set
+      high_f = excluded.high_f,
+      low_f  = excluded.low_f,
+      lead_high_hours = excluded.lead_high_hours,
+      lead_low_hours  = excluded.lead_low_hours;
+    """
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
+    return len(rows)
 
 
 # -------------------------
-# Observations (supports multi-run snapshots IF schema exists)
+# Hourly forecast extras (ML) — no extras json, no created_at
 # -------------------------
 
-_OBS_SOURCE_PRIORITY = {
-    "NWS_CLI": 100,
-    "nws_cli": 100,
-    "NWS_OBS_FALLBACK": 10,
-    "nws_station_obs": 10,
-}
+def bulk_upsert_forecast_extras_hourly(conn, rows: List[dict]) -> int:
+    """
+    Requires: public.forecast_extras_hourly
+      (run_id uuid, station_id text, valid_time timestamptz,
+       temperature_f double precision,
+       dewpoint_f double precision,
+       humidity_pct double precision,
+       wind_speed_mph double precision,
+       wind_dir_deg double precision,
+       cloud_cover_pct double precision,
+       precip_prob_pct double precision,
+       primary key (run_id, station_id, valid_time))
 
-def _obs_priority(source: str) -> int:
-    return _OBS_SOURCE_PRIORITY.get(source, 0)
+    rows items:
+      run_id, station_id, valid_time (ISO or datetime),
+      temperature_f, dewpoint_f, humidity_pct,
+      wind_speed_mph, wind_dir_deg, cloud_cover_pct, precip_prob_pct
+    """
+    if not rows:
+        return 0
 
-_OBS_RUN_ISSUED_AT: Optional[str] = None
+    sql = """
+    insert into public.forecast_extras_hourly (
+      run_id, station_id, valid_time,
+      temperature_f, dewpoint_f, humidity_pct,
+      wind_speed_mph, wind_dir_deg, cloud_cover_pct,
+      precip_prob_pct
+    ) values (
+      %(run_id)s, %(station_id)s, %(valid_time)s::timestamptz,
+      %(temperature_f)s, %(dewpoint_f)s, %(humidity_pct)s,
+      %(wind_speed_mph)s, %(wind_dir_deg)s, %(cloud_cover_pct)s,
+      %(precip_prob_pct)s
+    )
+    on conflict (run_id, station_id, valid_time)
+    do update set
+      temperature_f = excluded.temperature_f,
+      dewpoint_f = excluded.dewpoint_f,
+      humidity_pct = excluded.humidity_pct,
+      wind_speed_mph = excluded.wind_speed_mph,
+      wind_dir_deg = excluded.wind_dir_deg,
+      cloud_cover_pct = excluded.cloud_cover_pct,
+      precip_prob_pct = excluded.precip_prob_pct;
+    """
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
+    return len(rows)
 
-def _get_obs_run_issued_at() -> str:
-    global _OBS_RUN_ISSUED_AT
-    if _OBS_RUN_ISSUED_AT is None:
-        _OBS_RUN_ISSUED_AT = utc_now_z()
-    return _OBS_RUN_ISSUED_AT
 
+# -------------------------
+# Observations (new; renamed from observations_v2)
+# -------------------------
 
-def get_or_create_observation_run(run_issued_at: str, conn=None) -> Any:
+def get_or_create_observation_run(*, run_issued_at: str, conn=None) -> Any:
+    """
+    Requires: public.observation_runs(run_id uuid pk, run_issued_at timestamptz unique)
+    """
     owns = False
     if conn is None:
         conn = get_conn()
@@ -112,7 +227,8 @@ def get_or_create_observation_run(run_issued_at: str, conn=None) -> Any:
                 """
                 insert into public.observation_runs (run_issued_at)
                 values (%s::timestamptz)
-                on conflict (run_issued_at) do update set run_issued_at = excluded.run_issued_at
+                on conflict (run_issued_at) do update set
+                  run_issued_at = excluded.run_issued_at
                 returning run_id
                 """,
                 (run_issued_at,),
@@ -127,502 +243,189 @@ def get_or_create_observation_run(run_issued_at: str, conn=None) -> Any:
 
 
 def upsert_observation(
+    *,
+    run_id: Any,
     station_id: str,
     obs_date: str,
-    observed_high: float,
-    observed_low: float,
-    issued_at: Optional[str] = None,
-    raw_text: Optional[str] = None,
-    source: str = "nws_station_obs",
-    *,
-    run_issued_at: Optional[str] = None,
+    observed_high: Optional[float],
+    observed_low: Optional[float],
+    source: str,
+    flagged: Optional[str] = None,
+    conn=None,
 ) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    run_issued_at = run_issued_at or _get_obs_run_issued_at()
-
-    try:
-        cur.execute("""
-            select
-              to_regclass('public.observation_runs') is not null as has_runs,
-              to_regclass('public.observations_v2') is not null as has_v2
-        """)
-        has_runs, has_v2 = cur.fetchone()
-        has_new = bool(has_runs) and bool(has_v2)
-
-        if has_new:
-            run_id = get_or_create_observation_run(run_issued_at, conn=conn)
-
-            cur.execute(
-                """
-                insert into public.observations_v2
-                  (run_id, station_id, date, observed_high, observed_low, issued_at, fetched_at, raw_text, source)
-                values
-                  (%s, %s, %s::date, %s, %s, %s::timestamptz, now(), %s, %s)
-                on conflict (run_id, station_id, date) do update set
-                  observed_high = excluded.observed_high,
-                  observed_low  = excluded.observed_low,
-                  issued_at     = coalesce(excluded.issued_at, public.observations_v2.issued_at),
-                  fetched_at    = now(),
-                  raw_text      = coalesce(excluded.raw_text, public.observations_v2.raw_text),
-                  source        = excluded.source
-                """,
-                (run_id, station_id, obs_date, observed_high, observed_low, issued_at, raw_text, source),
-            )
-            conn.commit()
-            return
-
-        # Legacy single-row with "no downgrade"
-        cur.execute(
-            """
-            select source
-            from public.observations
-            where station_id=%s and date=%s::date
-            """,
-            (station_id, obs_date),
-        )
-        row = cur.fetchone()
-        existing_source = row[0] if row else None
-
-        if existing_source is not None and _obs_priority(source) < _obs_priority(str(existing_source)):
-            cur.execute(
-                """
-                update public.observations
-                set fetched_at = now()
-                where station_id=%s and date=%s::date
-                """,
-                (station_id, obs_date),
-            )
-            conn.commit()
-            return
-
-        cur.execute(
-            """
-            insert into public.observations
-              (station_id, date, observed_high, observed_low, issued_at, fetched_at, raw_text, source)
-            values (%s,%s::date,%s,%s,%s::timestamptz, now(), %s, %s)
-            on conflict (station_id, date) do update set
-              observed_high=excluded.observed_high,
-              observed_low=excluded.observed_low,
-              issued_at=coalesce(excluded.issued_at, public.observations.issued_at),
-              fetched_at=now(),
-              raw_text=coalesce(excluded.raw_text, public.observations.raw_text),
-              source=excluded.source
-            """,
-            (station_id, obs_date, observed_high, observed_low, issued_at, raw_text, source),
-        )
-
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# -------------------------
-# Forecast runs
-# -------------------------
-
-def get_or_create_forecast_run(source: str, issued_at: str, conn=None) -> Any:
+    """
+    Requires: public.observations
+      (run_id uuid, station_id text, date date,
+       observed_high double precision, observed_low double precision,
+       source text, flagged text,
+       primary key (run_id, station_id, date))
+    """
     owns = False
     if conn is None:
         conn = get_conn()
         owns = True
+
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                insert into public.forecast_runs (source, issued_at)
-                values (%s, %s)
-                on conflict (source, issued_at) do update set source = excluded.source
-                returning run_id
+                insert into public.observations
+                  (run_id, station_id, date, observed_high, observed_low, source, flagged)
+                values
+                  (%s, %s, %s::date, %s, %s, %s, %s)
+                on conflict (run_id, station_id, date) do update set
+                  observed_high = excluded.observed_high,
+                  observed_low  = excluded.observed_low,
+                  source        = excluded.source,
+                  flagged       = excluded.flagged
                 """,
-                (source, issued_at),
+                (run_id, station_id, obs_date, observed_high, observed_low, source, flagged),
             )
-            run_id = cur.fetchone()[0]
         if owns:
             conn.commit()
-        return run_id
     finally:
         if owns:
             conn.close()
 
 
-# -------------------------
-# Daily forecasts (new preferred: public.forecasts_daily)
-# -------------------------
-
-def bulk_upsert_forecasts_daily(conn, rows: list[dict]) -> int:
-    """
-    rows items:
-      run_id, station_id, target_date,
-      high_f, low_f, lead_high_hours, lead_low_hours
-    """
-    if not rows:
-        return 0
-
-    sql = """
-    insert into public.forecasts_daily (
-        run_id, station_id, target_date,
-        high_f, low_f,
-        lead_high_hours, lead_low_hours
-    ) values (
-        %(run_id)s, %(station_id)s, %(target_date)s,
-        %(high_f)s, %(low_f)s,
-        %(lead_high_hours)s, %(lead_low_hours)s
-    )
-    on conflict (run_id, station_id, target_date)
-    do update set
-        high_f = excluded.high_f,
-        low_f  = excluded.low_f,
-        lead_high_hours = excluded.lead_high_hours,
-        lead_low_hours  = excluded.lead_low_hours;
-    """
+def _latest_observation_run_id(conn) -> Optional[Any]:
     with conn.cursor() as cur:
-        cur.executemany(sql, rows)
-    return len(rows)
-
-
-# -------------------------
-# Hourly extras (ML) — public.forecast_extras_hourly
-# -------------------------
-
-def bulk_upsert_forecast_extras_hourly(conn, rows: list[dict]) -> int:
-    """
-    rows items:
-      run_id, station_id, valid_time,
-      temperature_f, dewpoint_f, humidity_pct,
-      wind_speed_mph, wind_dir_deg, cloud_cover_pct,
-      precip_prob_pct, extras (dict or json string)
-    """
-    if not rows:
-        return 0
-
-    for r in rows:
-        ex = r.get("extras")
-        if isinstance(ex, dict):
-            r["extras"] = json.dumps(ex)
-
-    sql = """
-    insert into public.forecast_extras_hourly (
-        run_id, station_id, valid_time,
-        temperature_f, dewpoint_f, humidity_pct,
-        wind_speed_mph, wind_dir_deg, cloud_cover_pct,
-        precip_prob_pct, extras
-    ) values (
-        %(run_id)s, %(station_id)s, %(valid_time)s,
-        %(temperature_f)s, %(dewpoint_f)s, %(humidity_pct)s,
-        %(wind_speed_mph)s, %(wind_dir_deg)s, %(cloud_cover_pct)s,
-        %(precip_prob_pct)s, %(extras)s::jsonb
-    )
-    on conflict (run_id, station_id, valid_time)
-    do update set
-        temperature_f = excluded.temperature_f,
-        dewpoint_f    = excluded.dewpoint_f,
-        humidity_pct  = excluded.humidity_pct,
-        wind_speed_mph = excluded.wind_speed_mph,
-        wind_dir_deg   = excluded.wind_dir_deg,
-        cloud_cover_pct = excluded.cloud_cover_pct,
-        precip_prob_pct = excluded.precip_prob_pct,
-        extras = excluded.extras;
-    """
-    with conn.cursor() as cur:
-        cur.executemany(sql, rows)
-    return len(rows)
-
-
-# -------------------------
-# Legacy forecasts (public.forecasts) — keep for compatibility
-# -------------------------
-
-def bulk_upsert_forecast_values(conn, rows: list[dict]) -> int:
-    """
-    Back-compat writer for the legacy public.forecasts table.
-    If the table does not have jsonb 'extras', we omit it automatically.
-    """
-    if not rows:
-        return 0
-
-    has_extras = _has_table(conn, "public.forecasts")  # table exists
-    # Detect column existence
-    with conn.cursor() as cur:
-        cur.execute("""
-            select exists (
-              select 1 from information_schema.columns
-              where table_schema='public' and table_name='forecasts' and column_name='extras'
-            )
-        """)
-        has_extras_col = bool(cur.fetchone()[0])
-
-    if has_extras_col:
-        sql = """
-        insert into public.forecasts (
-            run_id, station_id, target_date, kind, value_f, lead_hours,
-            dewpoint_f, humidity_pct, wind_speed_mph, wind_dir_deg,
-            cloud_cover_pct, precip_prob_pct, extras
-        ) values (
-            %(run_id)s, %(station_id)s, %(target_date)s, %(kind)s, %(value_f)s, %(lead_hours)s,
-            %(dewpoint_f)s, %(humidity_pct)s, %(wind_speed_mph)s, %(wind_dir_deg)s,
-            %(cloud_cover_pct)s, %(precip_prob_pct)s, %(extras)s::jsonb
+        cur.execute(
+            """
+            select run_id
+            from public.observation_runs
+            order by run_issued_at desc
+            limit 1
+            """
         )
-        on conflict (run_id, station_id, target_date, kind)
-        do update set
-            value_f = excluded.value_f,
-            lead_hours = excluded.lead_hours,
-            dewpoint_f = excluded.dewpoint_f,
-            humidity_pct = excluded.humidity_pct,
-            wind_speed_mph = excluded.wind_speed_mph,
-            wind_dir_deg = excluded.wind_dir_deg,
-            cloud_cover_pct = excluded.cloud_cover_pct,
-            precip_prob_pct = excluded.precip_prob_pct,
-            extras = excluded.extras;
-        """
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+# -------------------------
+# Forecast errors (compact; keyed by run ids)
+# -------------------------
+
+def build_forecast_errors_for_date(*, target_date: str, observation_run_id: Optional[Any] = None) -> int:
+    """
+    Requires: public.forecast_errors (compact)
+      (forecast_run_id uuid, observation_run_id uuid, station_id text, target_date date, kind text,
+       forecast_f double precision, observed_f double precision,
+       error_f double precision, abs_error_f double precision,
+       lead_hours double precision,
+       primary key (forecast_run_id, observation_run_id, station_id, target_date, kind))
+
+    Reads:
+      - public.observations (for selected observation_run_id)
+      - public.forecasts_daily + public.forecast_runs
+    """
+    with get_conn() as conn:
+        if observation_run_id is None:
+            observation_run_id = _latest_observation_run_id(conn)
+            if observation_run_id is None:
+                return 0
+
         with conn.cursor() as cur:
-            cur.executemany(sql, rows)
-        return len(rows)
-
-    sql = """
-    insert into public.forecasts (
-        run_id, station_id, target_date, kind, value_f, lead_hours,
-        dewpoint_f, humidity_pct, wind_speed_mph, wind_dir_deg,
-        cloud_cover_pct, precip_prob_pct
-    ) values (
-        %(run_id)s, %(station_id)s, %(target_date)s, %(kind)s, %(value_f)s, %(lead_hours)s,
-        %(dewpoint_f)s, %(humidity_pct)s, %(wind_speed_mph)s, %(wind_dir_deg)s,
-        %(cloud_cover_pct)s, %(precip_prob_pct)s
-    )
-    on conflict (run_id, station_id, target_date, kind)
-    do update set
-        value_f = excluded.value_f,
-        lead_hours = excluded.lead_hours,
-        dewpoint_f = excluded.dewpoint_f,
-        humidity_pct = excluded.humidity_pct,
-        wind_speed_mph = excluded.wind_speed_mph,
-        wind_dir_deg = excluded.wind_dir_deg,
-        cloud_cover_pct = excluded.cloud_cover_pct,
-        precip_prob_pct = excluded.precip_prob_pct;
-    """
-    with conn.cursor() as cur:
-        cur.executemany(sql, rows)
-    return len(rows)
-
-
-def upsert_forecast_value(
-    *,
-    run_id: Any,
-    station_id: str,
-    target_date: str,
-    kind: str,
-    value_f: float,
-    lead_hours: Optional[float],
-    extras: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Legacy row-by-row upsert into public.forecasts (two-row high/low format).
-    Prefer bulk_upsert_forecasts_daily for new pipeline.
-    """
-    extras = extras or {}
-
-    cur_vals = (
-        run_id,
-        station_id,
-        target_date,
-        kind,
-        value_f,
-        lead_hours,
-        extras.get("dewpoint_f"),
-        extras.get("humidity_pct"),
-        extras.get("wind_speed_mph"),
-        extras.get("wind_dir_deg"),
-        extras.get("cloud_cover_pct"),
-        extras.get("precip_prob_pct"),
-    )
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        insert into public.forecasts
-          (run_id, station_id, target_date, kind, value_f, lead_hours,
-           dewpoint_f, humidity_pct, wind_speed_mph, wind_dir_deg, cloud_cover_pct, precip_prob_pct)
-        values
-          (%s,%s,%s::date,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        on conflict (run_id, station_id, target_date, kind) do update set
-          value_f=excluded.value_f,
-          lead_hours=coalesce(excluded.lead_hours, public.forecasts.lead_hours),
-          dewpoint_f=coalesce(excluded.dewpoint_f, public.forecasts.dewpoint_f),
-          humidity_pct=coalesce(excluded.humidity_pct, public.forecasts.humidity_pct),
-          wind_speed_mph=coalesce(excluded.wind_speed_mph, public.forecasts.wind_speed_mph),
-          wind_dir_deg=coalesce(excluded.wind_dir_deg, public.forecasts.wind_dir_deg),
-          cloud_cover_pct=coalesce(excluded.cloud_cover_pct, public.forecasts.cloud_cover_pct),
-          precip_prob_pct=coalesce(excluded.precip_prob_pct, public.forecasts.precip_prob_pct)
-        """,
-        cur_vals,
-    )
-
-    conn.commit()
-    conn.close()
-
-
-# -------------------------
-# Errors + stats (updated to prefer forecasts_daily)
-# -------------------------
-
-def build_errors_for_date(target_date: str) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("select to_regclass('public.observations_latest') is not null")
-    has_latest = bool(cur.fetchone()[0])
-
-    if has_latest:
-        cur.execute(
-            """
-            select station_id, observed_high, observed_low
-            from public.observations_latest
-            where date=%s::date
-            """,
-            (target_date,),
-        )
-    else:
-        cur.execute(
-            """
-            select station_id, observed_high, observed_low
-            from public.observations
-            where date=%s::date
-            """,
-            (target_date,),
-        )
-
-    obs_rows = cur.fetchall()
-    if not obs_rows:
-        conn.close()
-        return 0
-
-    has_daily = _has_table(conn, "public.forecasts_daily")
-
-    wrote = 0
-    for station_id, oh, ol in obs_rows:
-        if has_daily:
             cur.execute(
                 """
-                select d.run_id, r.source, r.issued_at,
-                       d.high_f, d.low_f,
-                       d.lead_high_hours, d.lead_low_hours
-                from public.forecasts_daily d
-                join public.forecast_runs r on r.run_id = d.run_id
-                where d.station_id=%s and d.target_date=%s::date
+                select station_id, observed_high, observed_low
+                from public.observations
+                where run_id=%s and date=%s::date
                 """,
-                (station_id, target_date),
+                (observation_run_id, target_date),
             )
+            obs_rows = cur.fetchall()
 
-            for run_id, source, issued_at, high_f, low_f, lead_high, lead_low in cur.fetchall():
-                # high
-                if high_f is not None:
-                    forecast_id = f"{run_id}|{station_id}|{target_date}|high"
-                    observed_f = float(oh)
-                    error_f = float(high_f) - observed_f
-                    cur.execute(
-                        """
-                        insert into public.forecast_errors
-                          (forecast_id, station_id, source, target_date, kind, issued_at, lead_hours,
-                           forecast_f, observed_f, error_f, abs_error_f)
-                        values
-                          (%s,%s,%s,%s::date,'high',%s,%s,%s,%s,%s,%s)
-                        on conflict (forecast_id) do nothing
-                        """,
-                        (
-                            forecast_id,
-                            station_id,
-                            source,
-                            target_date,
-                            issued_at,
-                            lead_high,
-                            high_f,
-                            observed_f,
-                            error_f,
-                            abs(error_f),
-                        ),
-                    )
-                    wrote += 1
+            if not obs_rows:
+                return 0
 
-                # low
-                if low_f is not None:
-                    forecast_id = f"{run_id}|{station_id}|{target_date}|low"
-                    observed_f = float(ol)
-                    error_f = float(low_f) - observed_f
-                    cur.execute(
-                        """
-                        insert into public.forecast_errors
-                          (forecast_id, station_id, source, target_date, kind, issued_at, lead_hours,
-                           forecast_f, observed_f, error_f, abs_error_f)
-                        values
-                          (%s,%s,%s,%s::date,'low',%s,%s,%s,%s,%s,%s)
-                        on conflict (forecast_id) do nothing
-                        """,
-                        (
-                            forecast_id,
-                            station_id,
-                            source,
-                            target_date,
-                            issued_at,
-                            lead_low,
-                            low_f,
-                            observed_f,
-                            error_f,
-                            abs(error_f),
-                        ),
-                    )
-                    wrote += 1
+            wrote = 0
 
-        else:
-            # legacy path
-            cur.execute(
-                """
-                select f.run_id, r.source, r.issued_at, f.kind, f.value_f, f.lead_hours
-                from public.forecasts f
-                join public.forecast_runs r on r.run_id = f.run_id
-                where f.station_id=%s and f.target_date=%s::date
-                """,
-                (station_id, target_date),
-            )
-
-            for run_id, source, issued_at, kind, forecast_f, lead_hours in cur.fetchall():
-                if forecast_f is None:
-                    continue
-                observed_f = float(oh) if kind == "high" else float(ol)
-                error_f = float(forecast_f) - observed_f
-                abs_error_f = abs(error_f)
-                forecast_id = f"{run_id}|{station_id}|{target_date}|{kind}"
-
+            for station_id, oh, ol in obs_rows:
                 cur.execute(
                     """
-                    insert into public.forecast_errors
-                      (forecast_id, station_id, source, target_date, kind, issued_at, lead_hours,
-                       forecast_f, observed_f, error_f, abs_error_f)
-                    values
-                      (%s,%s,%s,%s::date,%s,%s,%s,%s,%s,%s,%s)
-                    on conflict (forecast_id) do nothing
+                    select d.run_id, r.source, r.issued_at,
+                           d.high_f, d.low_f,
+                           d.lead_high_hours, d.lead_low_hours
+                    from public.forecasts_daily d
+                    join public.forecast_runs r on r.run_id = d.run_id
+                    where d.station_id=%s and d.target_date=%s::date
                     """,
-                    (
-                        forecast_id,
-                        station_id,
-                        source,
-                        target_date,
-                        kind,
-                        issued_at,
-                        lead_hours,
-                        forecast_f,
-                        observed_f,
-                        error_f,
-                        abs_error_f,
-                    ),
+                    (station_id, target_date),
                 )
-                wrote += 1
 
-    conn.commit()
-    conn.close()
-    return wrote
+                for forecast_run_id, _source, _issued_at, high_f, low_f, lead_high, lead_low in cur.fetchall():
+                    # high
+                    if high_f is not None and oh is not None:
+                        err = float(high_f) - float(oh)
+                        cur.execute(
+                            """
+                            insert into public.forecast_errors
+                              (forecast_run_id, observation_run_id, station_id, target_date, kind,
+                               forecast_f, observed_f, error_f, abs_error_f, lead_hours)
+                            values
+                              (%s,%s,%s,%s::date,'high',%s,%s,%s,%s,%s)
+                            on conflict (forecast_run_id, observation_run_id, station_id, target_date, kind)
+                            do update set
+                              forecast_f = excluded.forecast_f,
+                              observed_f = excluded.observed_f,
+                              error_f = excluded.error_f,
+                              abs_error_f = excluded.abs_error_f,
+                              lead_hours = excluded.lead_hours
+                            """,
+                            (
+                                forecast_run_id,
+                                observation_run_id,
+                                station_id,
+                                target_date,
+                                float(high_f),
+                                float(oh),
+                                err,
+                                abs(err),
+                                lead_high,
+                            ),
+                        )
+                        wrote += 1
 
+                    # low
+                    if low_f is not None and ol is not None:
+                        err = float(low_f) - float(ol)
+                        cur.execute(
+                            """
+                            insert into public.forecast_errors
+                              (forecast_run_id, observation_run_id, station_id, target_date, kind,
+                               forecast_f, observed_f, error_f, abs_error_f, lead_hours)
+                            values
+                              (%s,%s,%s,%s::date,'low',%s,%s,%s,%s,%s)
+                            on conflict (forecast_run_id, observation_run_id, station_id, target_date, kind)
+                            do update set
+                              forecast_f = excluded.forecast_f,
+                              observed_f = excluded.observed_f,
+                              error_f = excluded.error_f,
+                              abs_error_f = excluded.abs_error_f,
+                              lead_hours = excluded.lead_hours
+                            """,
+                            (
+                                forecast_run_id,
+                                observation_run_id,
+                                station_id,
+                                target_date,
+                                float(low_f),
+                                float(ol),
+                                err,
+                                abs(err),
+                                lead_low,
+                            ),
+                        )
+                        wrote += 1
+
+        conn.commit()
+        return wrote
+
+
+# -------------------------
+# Dashboard stats (renamed from error_stats)
+# -------------------------
 
 def _percentile(sorted_vals: List[float], p: float) -> float:
     if not sorted_vals:
@@ -638,172 +441,114 @@ def _percentile(sorted_vals: List[float], p: float) -> float:
     d1 = sorted_vals[c] * (k - f)
     return float(d0 + d1)
 
-def compute_revisions_for_run(run_id: Any) -> int:
+
+def update_dashboard_stats(*, window_days: int, station_id: Optional[str] = None) -> None:
     """
-    For all forecast rows in a run, compute delta vs previous issued_at for the same
-    (station_id, source, kind, target_date). Idempotent via PK.
+    Requires: public.dashboard_stats
+      (station_id text, source text, kind text ('high','low','both'),
+       window_days int, n int, bias double, mae double, rmse double, p10 double, p50 double, p90 double,
+       last_updated timestamptz,
+       primary key (station_id, source, kind, window_days))
 
-    NOTE: If public.forecast_revisions doesn't exist, this becomes a no-op.
+    Reads:
+      - public.forecast_errors
+      - public.forecast_runs (for source)
     """
-    conn = get_conn()
-    cur = conn.cursor()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            params: List[Any] = [window_days]
+            station_clause = ""
+            if station_id:
+                station_clause = "and e.station_id=%s"
+                params.append(station_id)
 
-    # If the revisions table isn't present (migration mismatch), skip cleanly.
-    cur.execute("select to_regclass('public.forecast_revisions') is not null")
-    has_revisions = bool(cur.fetchone()[0])
-    if not has_revisions:
-        conn.close()
-        return 0
+            cur.execute(
+                f"""
+                select
+                  e.station_id,
+                  r.source,
+                  e.kind,
+                  e.error_f,
+                  e.abs_error_f
+                from public.forecast_errors e
+                join public.forecast_runs r on r.run_id = e.forecast_run_id
+                where e.target_date >= (now()::date - (%s::int * interval '1 day'))
+                {station_clause}
+                """,
+                params,
+            )
+            rows = cur.fetchall()
 
-    cur.execute(
-        """
-        select r.source, r.issued_at, f.station_id, f.target_date, f.kind, f.value_f
-        from public.forecasts f
-        join public.forecast_runs r on r.run_id = f.run_id
-        where f.run_id = %s
-        """,
-        (run_id,),
-    )
-    rows = cur.fetchall()
-    if not rows:
-        conn.close()
-        return 0
+            by: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = {}
+            for st_id, source, kind, e, ae in rows:
+                if st_id is None or source is None or kind is None:
+                    continue
+                if e is None or ae is None:
+                    continue
+                by.setdefault((str(st_id), str(source), str(kind)), []).append((float(e), float(ae)))
 
-    wrote = 0
-    for source, issued_at, station_id, target_date, kind, forecast_f in rows:
-        if forecast_f is None:
-            continue
+            # per (station, source, kind)
+            for (st_id, source, kind), vals in by.items():
+                n = len(vals)
+                if n == 0:
+                    continue
 
-        cur.execute(
-            """
-            select r2.issued_at, f2.value_f
-            from public.forecasts f2
-            join public.forecast_runs r2 on r2.run_id = f2.run_id
-            where f2.station_id=%s
-              and r2.source=%s
-              and f2.kind=%s
-              and f2.target_date=%s::date
-              and r2.issued_at < %s::timestamptz
-            order by r2.issued_at desc
-            limit 1
-            """,
-            (station_id, source, kind, target_date, issued_at),
-        )
-        prev = cur.fetchone()
-        prev_issued_at = prev[0] if prev else None
-        prev_forecast_f = float(prev[1]) if (prev and prev[1] is not None) else None
-        delta_f = (float(forecast_f) - prev_forecast_f) if prev_forecast_f is not None else None
+                errors = [v[0] for v in vals]
+                abs_errors = [v[1] for v in vals]
 
-        cur.execute(
-            """
-            insert into public.forecast_revisions
-              (station_id, source, kind, target_date, issued_at, forecast_f,
-               prev_issued_at, prev_forecast_f, delta_f)
-            values
-              (%s,%s,%s,%s::date,%s::timestamptz,%s,%s::timestamptz,%s,%s)
-            on conflict (station_id, source, kind, target_date, issued_at) do nothing
-            """,
-            (
-                station_id,
-                source,
-                kind,
-                target_date,
-                issued_at,
-                float(forecast_f),
-                prev_issued_at,
-                prev_forecast_f,
-                delta_f,
-            ),
-        )
-        wrote += 1
+                bias = sum(errors) / n
+                mae = sum(abs_errors) / n
+                rmse = (sum((x * x) for x in errors) / n) ** 0.5
 
-    conn.commit()
-    conn.close()
-    return wrote
+                se = sorted(errors)
+                p10 = _percentile(se, 0.10)
+                p50 = _percentile(se, 0.50)
+                p90 = _percentile(se, 0.90)
 
-def update_error_stats(*, window_days: int, station_id: Optional[str] = None) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
+                cur.execute(
+                    """
+                    insert into public.dashboard_stats
+                      (station_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90, last_updated)
+                    values
+                      (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                    on conflict (station_id, source, kind, window_days) do update set
+                      n=excluded.n,
+                      bias=excluded.bias,
+                      mae=excluded.mae,
+                      rmse=excluded.rmse,
+                      p10=excluded.p10,
+                      p50=excluded.p50,
+                      p90=excluded.p90,
+                      last_updated=now()
+                    """,
+                    (st_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90),
+                )
 
-    params: List[Any] = [window_days]
-    station_clause = ""
-    if station_id:
-        station_clause = "and station_id=%s"
-        params.append(station_id)
+            # 'both' rollup
+            stations_sources = sorted({(k[0], k[1]) for k in by.keys()})
+            for st_id, source in stations_sources:
+                highs = by.get((st_id, source, "high"), [])
+                lows = by.get((st_id, source, "low"), [])
+                if not highs or not lows:
+                    continue
 
-    cur.execute(
-        f"""
-        select station_id, source, kind, error_f, abs_error_f
-        from public.forecast_errors
-        where target_date >= (now()::date - (%s::int * interval '1 day'))
-        {station_clause}
-        """,
-        params,
-    )
-    rows = cur.fetchall()
+                mae_high = sum(v[1] for v in highs) / len(highs)
+                mae_low = sum(v[1] for v in lows) / len(lows)
+                mae_both = (mae_high + mae_low) / 2.0
+                n = min(len(highs), len(lows))
 
-    by: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = {}
-    for st_id, source, kind, e, ae in rows:
-        if st_id is None or source is None or kind is None:
-            continue
-        if e is None or ae is None:
-            continue
-        by.setdefault((str(st_id), str(source), str(kind)), []).append((float(e), float(ae)))
+                cur.execute(
+                    """
+                    insert into public.dashboard_stats
+                      (station_id, source, kind, window_days, n, mae, last_updated)
+                    values
+                      (%s,%s,'both',%s,%s,%s, now())
+                    on conflict (station_id, source, kind, window_days) do update set
+                      n=excluded.n,
+                      mae=excluded.mae,
+                      last_updated=now()
+                    """,
+                    (st_id, source, window_days, n, mae_both),
+                )
 
-    now_ts = utc_now_z()
-
-    for (st_id, source, kind), vals in by.items():
-        n = len(vals)
-        if n == 0:
-            continue
-
-        errors = [v[0] for v in vals]
-        abs_errors = [v[1] for v in vals]
-
-        bias = sum(errors) / n
-        mae = sum(abs_errors) / n
-        rmse = (sum((x * x) for x in errors) / n) ** 0.5
-
-        se = sorted(errors)
-        p10 = _percentile(se, 0.10)
-        p50 = _percentile(se, 0.50)
-        p90 = _percentile(se, 0.90)
-
-        cur.execute(
-            """
-            insert into public.error_stats
-              (station_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90, last_updated)
-            values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::timestamptz)
-            on conflict (station_id, source, kind, window_days) do update set
-              n=excluded.n, bias=excluded.bias, mae=excluded.mae, rmse=excluded.rmse,
-              p10=excluded.p10, p50=excluded.p50, p90=excluded.p90, last_updated=excluded.last_updated
-            """,
-            (st_id, source, kind, window_days, n, bias, mae, rmse, p10, p50, p90, now_ts),
-        )
-
-    stations_sources = sorted({(k[0], k[1]) for k in by.keys()})
-    for st_id, source in stations_sources:
-        highs = by.get((st_id, source, "high"), [])
-        lows = by.get((st_id, source, "low"), [])
-        if not highs or not lows:
-            continue
-
-        mae_high = sum(v[1] for v in highs) / len(highs)
-        mae_low = sum(v[1] for v in lows) / len(lows)
-        mae_both = (mae_high + mae_low) / 2.0
-        n = min(len(highs), len(lows))
-
-        cur.execute(
-            """
-            insert into public.error_stats
-              (station_id, source, kind, window_days, n, mae, last_updated)
-            values (%s,%s,'both',%s,%s,%s,%s::timestamptz)
-            on conflict (station_id, source, kind, window_days) do update set
-              n=excluded.n, mae=excluded.mae, last_updated=excluded.last_updated
-            """,
-            (st_id, source, window_days, n, mae_both, now_ts),
-        )
-
-    conn.commit()
-    conn.close()
-
+        conn.commit()
