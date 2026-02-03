@@ -129,7 +129,7 @@ def bulk_upsert_forecasts_daily(conn, rows: List[dict]) -> int:
        primary key (run_id, station_id, target_date))
 
     rows items:
-      run_id, station_id, target_date, high_f, low_f, lead_high_hours, lead_low_hours
+      run_id, station_id, target_date, high_f, low_f, lead_hours_high, lead_hours_low
     """
     if not rows:
         return 0
@@ -138,18 +138,18 @@ def bulk_upsert_forecasts_daily(conn, rows: List[dict]) -> int:
     insert into public.forecasts_daily (
       run_id, station_id, target_date,
       high_f, low_f,
-      lead_high_hours, lead_low_hours
+      lead_hours_high, lead_hours_low
     ) values (
       %(run_id)s, %(station_id)s, %(target_date)s::date,
       %(high_f)s, %(low_f)s,
-      %(lead_high_hours)s, %(lead_low_hours)s
+      %(lead_hours_high)s, %(lead_hours_low)s
     )
     on conflict (run_id, station_id, target_date)
     do update set
       high_f = excluded.high_f,
       low_f  = excluded.low_f,
-      lead_high_hours = excluded.lead_high_hours,
-      lead_low_hours  = excluded.lead_low_hours;
+      lead_hours_high = excluded.lead_hours_high,
+      lead_hours_low  = excluded.lead_hours_low;
     """
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
@@ -346,7 +346,7 @@ def build_forecast_errors_for_date(*, target_date: str, observation_run_id: Opti
                     """
                     select d.run_id, r.source, r.issued_at,
                            d.high_f, d.low_f,
-                           d.lead_high_hours, d.lead_low_hours
+                           d.lead_hours_high, d.lead_hours_low
                     from public.forecasts_daily d
                     join public.forecast_runs r on r.run_id = d.run_id
                     where d.station_id=%s and d.target_date=%s::date
@@ -552,4 +552,5 @@ def update_dashboard_stats(*, window_days: int, station_id: Optional[str] = None
                 )
 
         conn.commit()
+
 
