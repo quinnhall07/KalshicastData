@@ -2,86 +2,125 @@
 from __future__ import annotations
 
 import os
-import requests
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List
 
+import requests
+
 from config import HEADERS
 
-BASE = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/"
+VCR_URL = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
+
+
+def _utc_now_z() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _get_key() -> str:
     key = os.getenv("VISUALCROSSING_KEY")
     if not key:
-        raise RuntimeError(
-            "Missing VISUALCROSSING_KEY env var.\n"
-            "PowerShell: $env:VISUALCROSSING_KEY='...'\n"
-            "macOS/Linux: export VISUALCROSSING_KEY='...'"
-        )
+        raise RuntimeError("Missing VISUALCROSSING_KEY env var")
     return key
 
 
 def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
-    Visual Crossing Timeline API -> standardized output
-    Returns:
-      {"issued_at":"...Z","rows":[{"target_date":"YYYY-MM-DD","high":..,"low":..}, ...]}
+    Strict payload shape:
+      {
+        "issued_at": "...Z",
+        "rows": [
+          {"target_date": "YYYY-MM-DD", "high": float, "low": float, "extras": {...}},
+          ...
+        ]
+      }
+
+    Notes:
+      - Default horizon: 3 days (today + next 2 days)
+      - Extras are daily aggregates from Visual Crossing if available.
     """
+    params = params or {}
+
     lat = station.get("lat")
     lon = station.get("lon")
     if lat is None or lon is None:
         raise ValueError("Visual Crossing fetch requires station['lat'] and station['lon'].")
 
-    params = params or {}
-    unit_group = params.get("unitGroup", "us")
-    ndays = int(params.get("days", 2))
+    key = _get_key()
 
-    today = date.today()
-    end = date.fromordinal(today.toordinal() + (ndays - 1))
+    ndays = int(params.get("days", 3))
+    if ndays < 1:
+        ndays = 1
 
-    location = f"{float(lat)},{float(lon)}"
-    url = f"{BASE}{location}/{today.isoformat()}/{end.isoformat()}"
+    base = date.today()
+    start = base.isoformat()
+    end = date.fromordinal(base.toordinal() + (ndays - 1)).isoformat()
+    want = {date.fromordinal(base.toordinal() + i).isoformat() for i in range(ndays)}
 
+    # unitGroup=us returns Fahrenheit, mph, etc.
     q = {
-        "key": _get_key(),
-        "unitGroup": unit_group,
+        "unitGroup": "us",
+        "key": key,
         "contentType": "json",
         "include": "days",
-        "elements": "datetime,tempmax,tempmin,humidity,windspeed,winddir,cloudcover,precipprob",
     }
 
-    r = requests.get(url, params=q, headers=dict(HEADERS), timeout=20)
+    url = f"{VCR_URL}/{float(lat)},{float(lon)}/{start}/{end}"
+    r = requests.get(url, params=q, headers=dict(HEADERS), timeout=25)
     r.raise_for_status()
     data = r.json()
 
-    issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
     days = data.get("days") or []
-    if not days:
-        raise RuntimeError(f"Visual Crossing returned no 'days' for {location}")
+    rows: List[Dict[str, Any]] = []
 
-    rows: List[dict] = []
-    for d in days:
-        dt = (d.get("datetime") or "")[:10]
-        hi = d.get("tempmax")
-        lo = d.get("tempmin")
-        if not dt or hi is None or lo is None:
+    for drec in days:
+        d = str(drec.get("datetime") or "")[:10]
+        if not d or d not in want:
             continue
 
-        row: Dict[str, Any] = {"target_date": dt, "high": float(hi), "low": float(lo)}
+        try:
+            hi = float(drec.get("tempmax"))
+            lo = float(drec.get("tempmin"))
+        except Exception:
+            continue
 
-        if d.get("humidity") is not None:
-            row["humidity_pct"] = float(d["humidity"])
-        if d.get("windspeed") is not None:
-            row["wind_speed_mph"] = float(d["windspeed"])
-        if d.get("winddir") is not None:
-            row["wind_dir_deg"] = float(d["winddir"])
-        if d.get("cloudcover") is not None:
-            row["cloud_cover_pct"] = float(d["cloudcover"])
-        if d.get("precipprob") is not None:
-            row["precip_prob_pct"] = float(d["precipprob"])
+        extras: Dict[str, Any] = {}
 
-        rows.append(row)
+        v = drec.get("humidity")
+        if v is not None:
+            try:
+                extras["humidity_pct"] = float(v)
+            except Exception:
+                pass
 
-    return {"issued_at": issued_at, "rows": rows}
+        v = drec.get("windspeed")
+        if v is not None:
+            try:
+                extras["wind_speed_mph"] = float(v)
+            except Exception:
+                pass
+
+        v = drec.get("winddir")
+        if v is not None:
+            try:
+                extras["wind_dir_deg"] = float(v)
+            except Exception:
+                pass
+
+        v = drec.get("cloudcover")
+        if v is not None:
+            try:
+                extras["cloud_cover_pct"] = float(v)
+            except Exception:
+                pass
+
+        # Visual Crossing provides precipprob in some plans/fields; keep if present.
+        v = drec.get("precipprob")
+        if v is not None:
+            try:
+                extras["precip_prob_pct"] = float(v)
+            except Exception:
+                pass
+
+        rows.append({"target_date": d, "high": hi, "low": lo, "extras": extras})
+
+    return {"issued_at": _utc_now_z(), "rows": rows}
