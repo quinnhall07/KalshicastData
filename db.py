@@ -124,8 +124,8 @@ def bulk_upsert_forecasts_daily(conn, rows: List[dict]) -> int:
     """
     Requires: public.forecasts_daily
       (run_id uuid, station_id text, target_date date,
-       high_f double precision, low_f double precision,
-       lead_high_hours double precision, lead_low_hours double precision,
+       high_f real, low_f real,
+       lead_hours_high real, lead_hours_low real,
        primary key (run_id, station_id, target_date))
 
     rows items:
@@ -552,3 +552,4 @@ def update_dashboard_stats(*, window_days: int, station_id: Optional[str] = None
                 )
 
         conn.commit()
+
