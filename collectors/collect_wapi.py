@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import os
-import requests
 from datetime import date, datetime, timezone
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
+import requests
 
 from config import HEADERS
 
@@ -14,75 +15,106 @@ WAPI_URL = "https://api.weatherapi.com/v1/forecast.json"
 def _get_key() -> str:
     key = os.getenv("WEATHERAPI_KEY")
     if not key:
-        raise RuntimeError(
-            "Missing WEATHERAPI_KEY env var. Set it before running.\n"
-            "PowerShell: $env:WEATHERAPI_KEY='...'\n"
-            "macOS/Linux: export WEATHERAPI_KEY='...'"
-        )
+        raise RuntimeError("Missing WEATHERAPI_KEY env var")
     return key
 
 
-def fetch_wapi_forecast(station: dict) -> Dict[str, Any]:
+def _utc_now_z() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def fetch_wapi_forecast(station: dict, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
-    WeatherAPI.com forecast -> standardized output
-    Returns:
-      {"issued_at":"...Z","rows":[{"target_date":"YYYY-MM-DD","high":..,"low":..}, ...]}
+    Strict payload shape:
+      {
+        "issued_at": "...Z",
+        "rows": [
+          {"target_date": "YYYY-MM-DD", "high": float, "low": float, "extras": {...}},
+          ...
+        ]
+      }
+
+    Notes:
+      - Default horizon: 3 days (today + next 2 days)
+      - Extras are daily aggregates from WeatherAPI if available.
     """
+    params = params or {}
+
     lat = station.get("lat")
     lon = station.get("lon")
     if lat is None or lon is None:
         raise ValueError("WeatherAPI fetch requires station['lat'] and station['lon'].")
 
-    params = {
-        "key": _get_key(),
+    key = _get_key()
+
+    ndays = int(params.get("days", 3))
+    if ndays < 1:
+        ndays = 1
+
+    base = date.today()
+    want = {date.fromordinal(base.toordinal() + i).isoformat() for i in range(ndays)}
+
+    q = {
+        "key": key,
         "q": f"{float(lat)},{float(lon)}",
-        "days": 2,
+        "days": ndays,
         "aqi": "no",
         "alerts": "no",
     }
 
-    r = requests.get(WAPI_URL, params=params, headers=dict(HEADERS), timeout=20)
+    r = requests.get(WAPI_URL, params=q, headers=dict(HEADERS), timeout=25)
     r.raise_for_status()
     data = r.json()
 
-    # Prefer provider's timestamp if present; else now()
-    issued_at = (
-        (data.get("current") or {}).get("last_updated_epoch")
-        or (data.get("location") or {}).get("localtime_epoch")
-    )
-    if issued_at:
-        issued_at = datetime.fromtimestamp(int(issued_at), tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    else:
-        issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    issued_at = _utc_now_z()
+    current = data.get("current") or {}
+    last_updated = current.get("last_updated")
+    if isinstance(last_updated, str) and last_updated.strip():
+        # WeatherAPI timestamps are local to location; keep our issued_at as UTC snapshot time
+        # to avoid mixing tz semantics across providers.
+        pass
 
-    fc = (data.get("forecast") or {}).get("forecastday") or []
-    if not fc:
-        raise RuntimeError(f"WeatherAPI returned no forecastday data for {lat},{lon}")
+    forecast = (data.get("forecast") or {}).get("forecastday") or []
+    rows: List[Dict[str, Any]] = []
 
-    rows: List[dict] = []
-    for day in fc:
-        d = (day.get("date") or "")[:10]
-        daypart = day.get("day") or {}
-        hi = daypart.get("maxtemp_f")
-        lo = daypart.get("mintemp_f")
-        if not d or hi is None or lo is None:
+    for day in forecast:
+        d = str(day.get("date") or "")[:10]
+        if not d or d not in want:
             continue
 
-        # Optional Tier-1 extras if present
+        daydata = day.get("day") or {}
+        try:
+            hi = float(daydata.get("maxtemp_f"))
+            lo = float(daydata.get("mintemp_f"))
+        except Exception:
+            continue
+
         extras: Dict[str, Any] = {}
-        avgh = daypart.get("avghumidity")
-        if avgh is not None:
-            extras["humidity_pct"] = float(avgh)
 
-        precip = daypart.get("daily_chance_of_rain")
-        if precip is not None:
-            extras["precip_prob_pct"] = float(precip)
+        v = daydata.get("avghumidity")
+        if v is not None:
+            try:
+                extras["humidity_pct"] = float(v)
+            except Exception:
+                pass
 
-        rows.append({"target_date": d, "high": float(hi), "low": float(lo), **extras})
+        v = daydata.get("maxwind_mph")
+        if v is not None:
+            try:
+                extras["wind_speed_mph"] = float(v)
+            except Exception:
+                pass
 
-    today = date.today().isoformat()
-    tomorrow = date.fromordinal(date.today().toordinal() + 1).isoformat()
-    want = {today, tomorrow}
-    rows = [x for x in rows if x["target_date"] in want]
+        v = daydata.get("daily_chance_of_rain")
+        if v is not None:
+            try:
+                extras["precip_prob_pct"] = float(v)
+            except Exception:
+                pass
+
+        v = daydata.get("daily_chance_of_snow")
+        # Optional: you can keep this in extras later if you add a column; for now ignore.
+
+        rows.append({"target_date": d, "high": hi, "low": lo, "extras": extras})
 
     return {"issued_at": issued_at, "rows": rows}
